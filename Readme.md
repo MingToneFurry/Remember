@@ -81,6 +81,8 @@
 
 ## 部署步骤（完整）
 
+> 详细版本请查看：[docx/deployment.md](docx/deployment.md)
+
 ## 1) 创建 Cloudflare 资源
 1. Worker：绑定域名 `rem.furry.ist`
 2. R2 bucket：`remember-data`

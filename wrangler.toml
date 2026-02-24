@@ -4,8 +4,8 @@ compatibility_date = "2026-01-15"
 workers_dev = true
 
 [vars]
-TURNSTILE_SITE_KEY = ""
-ACCESS_AUD = ""
+TURNSTILE_SITE_KEY = "0x4AAAAAAB4QPl_JmbOFAf6Z"
+ACCESS_AUD = "a19fcd53a38c408af9e08759d726fe4e2d334f93aed63040c3d3fa40a040ec9b"
 
 [[r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -13,14 +13,14 @@ bucket_name = "remember-data"
 
 [[kv_namespaces]]
 binding = "REMEMBER_KV"
-id = "00000000000000000000000000000000"
+id = "931cf5977880499b818e9318f8122de9"
 
 [env.production]
 routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
 
 [env.production.vars]
-TURNSTILE_SITE_KEY = ""
-ACCESS_AUD = ""
+TURNSTILE_SITE_KEY = "0x4AAAAAAB4QPl_JmbOFAf6Z"
+ACCESS_AUD = "a19fcd53a38c408af9e08759d726fe4e2d334f93aed63040c3d3fa40a040ec9b"
 
 [[env.production.r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -28,4 +28,7 @@ bucket_name = "remember-data"
 
 [[env.production.kv_namespaces]]
 binding = "REMEMBER_KV"
-id = "00000000000000000000000000000000"
+id = "931cf5977880499b818e9318f8122de9"
+
+[env.production.triggers]
+crons = ["0 4 * * *"]
