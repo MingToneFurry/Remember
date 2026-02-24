@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { UpstreamClient } from "../src/services/upstreamClient.js";
-import { fetchAllVideosByUid } from "../src/services/memorialData.js";
+import { fetchAllVideosByUid, fetchPagedAicuData } from "../src/services/memorialData.js";
 
 function jsonResponse(status, data) {
   return new Response(JSON.stringify(data), {
@@ -38,4 +38,47 @@ test("fetchAllVideosByUid should return empty list for zero total", async () => 
   const result = await fetchAllVideosByUid(client, "456");
   assert.equal(result.total, 0);
   assert.deepEqual(result.videos, []);
+});
+
+test("fetchPagedAicuData should stop by is_end and keep all_count", async () => {
+  const pages = [
+    {
+      code: 0,
+      data: { cursor: { is_end: false, all_count: 3 }, replies: [{ id: 1 }, { id: 2 }] },
+    },
+    {
+      code: 0,
+      data: { cursor: { is_end: true, all_count: 3 }, replies: [{ id: 3 }] },
+    },
+  ];
+  let idx = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["api.aicu.cc"],
+    retries: 0,
+    timeoutMs: 200,
+    fetchImpl: async () => jsonResponse(200, pages[idx++] || pages[1]),
+  });
+  const result = await fetchPagedAicuData(client, "comment", "123", { maxPages: 10, maxItems: 100 });
+  assert.equal(result.total, 3);
+  assert.equal(result.items.length, 3);
+  assert.equal(result.truncated, false);
+});
+
+test("fetchPagedAicuData should truncate when hitting maxItems", async () => {
+  const page = {
+    code: 0,
+    data: {
+      cursor: { is_end: false, all_count: 300 },
+      videodmlist: Array.from({ length: 100 }, (_, i) => ({ id: i + 1 })),
+    },
+  };
+  const client = new UpstreamClient({
+    allowedHosts: ["api.aicu.cc"],
+    retries: 0,
+    timeoutMs: 200,
+    fetchImpl: async () => jsonResponse(200, page),
+  });
+  const result = await fetchPagedAicuData(client, "danmu", "789", { maxPages: 10, maxItems: 150 });
+  assert.equal(result.items.length, 150);
+  assert.equal(result.truncated, true);
 });
