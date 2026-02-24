@@ -402,9 +402,11 @@ async function processGenerateJob(env, jobId) {
     const item = { uid, createdAt: Date.now(), url: `/u/${uid}` };
     await env.REMEMBER_KV.put(`meta:uid:${uid}`, JSON.stringify(item));
     await saveRecent(env, item);
+    const recentList = await getRecent(env, MAX_RECENT);
+    const sitemap = await sitemapXml(env);
 
     await patchJob({ stage: "syncing", progress: 95, warnings });
-    const gitSync = await syncGeneratedPageToGitHub(env, { uid, html, snapshot, item });
+    const gitSync = await syncGeneratedPageToGitHub(env, { uid, html, snapshot, item, recentList, sitemapXml: sitemap });
     if (gitSync.status !== "succeeded" && gitSync.reason) {
       warnings.push(`Git 同步异常: ${gitSync.reason}`);
     }

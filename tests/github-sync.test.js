@@ -36,3 +36,39 @@ test("syncGeneratedPageToGitHub should commit file and return sha", async () => 
   assert.equal(result.commitSha, "abc123");
   assert.equal(calls, 2);
 });
+
+test("syncGeneratedPageToGitHub should write index files when payload provided", async () => {
+  let calls = 0;
+  const mockFetch = async (_url, init = {}) => {
+    calls += 1;
+    if (!init.method || init.method === "GET") {
+      return new Response("not found", { status: 404 });
+    }
+    return new Response(JSON.stringify({ commit: { sha: "idx456" } }), {
+      status: 201,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const result = await syncGeneratedPageToGitHub(
+    {
+      GITHUB_OWNER: "owner",
+      GITHUB_REPO: "repo",
+      GITHUB_TOKEN: "token",
+      GITHUB_BRANCH: "generated-pages",
+      GITHUB_PAGES_PREFIX: "generated",
+    },
+    {
+      uid: "200",
+      html: "<html>ok</html>",
+      item: { uid: "200", url: "/u/200" },
+      recentList: [{ uid: "200", url: "/u/200" }],
+      sitemapXml: "<?xml version=\"1.0\"?><urlset/>",
+    },
+    mockFetch,
+  );
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.files.includes("generated/recent.json"), true);
+  assert.equal(result.files.includes("generated/sitemap.xml"), true);
+  assert.equal(calls, 8);
+});

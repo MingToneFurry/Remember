@@ -70,13 +70,44 @@ export async function syncGeneratedPageToGitHub(env, payload, fetchImpl = fetch)
 
   try {
     const uid = String(payload.uid || "").trim();
-    const path = `${config.prefix}/pages/${encodeURIComponent(uid)}.html`;
-    const commitSha = await putFile(fetchImpl, config, path, payload.html, `chore: 更新 UID ${uid} 纪念页`);
+    const files = [
+      {
+        path: `${config.prefix}/pages/${encodeURIComponent(uid)}.html`,
+        content: String(payload.html || ""),
+        message: `chore: 更新 UID ${uid} 纪念页`,
+      },
+    ];
+    if (payload.item) {
+      files.push({
+        path: `${config.prefix}/meta/${encodeURIComponent(uid)}.json`,
+        content: JSON.stringify(payload.item, null, 2),
+        message: `chore: 更新 UID ${uid} 元数据`,
+      });
+    }
+    if (Array.isArray(payload.recentList)) {
+      files.push({
+        path: `${config.prefix}/recent.json`,
+        content: JSON.stringify({ updatedAt: Date.now(), items: payload.recentList }, null, 2),
+        message: "chore: 更新 recent 索引",
+      });
+    }
+    if (payload.sitemapXml) {
+      files.push({
+        path: `${config.prefix}/sitemap.xml`,
+        content: String(payload.sitemapXml),
+        message: "chore: 更新 sitemap 索引",
+      });
+    }
+
+    let commitSha = "";
+    for (const file of files) {
+      commitSha = await putFile(fetchImpl, config, file.path, file.content, file.message);
+    }
     return {
       status: "succeeded",
       branch: config.branch,
       commitSha,
-      files: [path],
+      files: files.map((f) => f.path),
       committedAt: Date.now(),
       reason: "",
     };
