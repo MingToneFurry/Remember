@@ -503,10 +503,44 @@ async function handleGenerate(request, env, ctx) {
   if (existingCooldown) throw new HttpError(429, "该 UID 处于冷却期，请稍后重试");
   await env.REMEMBER_KV.put(cooldownKey, "1", { expirationTtl: UID_COOLDOWN_SECONDS });
 
+  if (!env.ANALYSIS_QUEUE || typeof env.ANALYSIS_QUEUE.send !== "function") {
+    throw new HttpError(500, "队列未配置");
+  }
+
+  const now = Date.now();
   const jobId = randomId("job");
-  await env.REMEMBER_KV.put(`job:${jobId}`, JSON.stringify({ jobId, uid, status: "pending", createdAt: Date.now() }), { expirationTtl: 3600 });
-  ctx.waitUntil(processGenerateJob(env, jobId));
-  return jsonResponse({ ok: true, jobId }, 202, { "cache-control": "no-store" });
+  const traceId = randomId("trace");
+  const job = {
+    jobId,
+    uid,
+    status: "queued",
+    stage: "queued",
+    progress: 0,
+    warnings: [],
+    gitSync: null,
+    createdAt: now,
+    updatedAt: now,
+  };
+  await env.REMEMBER_KV.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 24 * 3600 });
+  await env.ANALYSIS_QUEUE.send(
+    JSON.stringify({
+      jobId,
+      uid,
+      requestedAt: now,
+      traceId,
+    }),
+  );
+  return jsonResponse(
+    {
+      ok: true,
+      jobId,
+      queued: true,
+      stage: "queued",
+      estimatedWaitSec: 15,
+    },
+    202,
+    { "cache-control": "no-store" },
+  );
 }
 
 async function handleJob(env, jobId) {
