@@ -6,6 +6,9 @@ workers_dev = true
 [vars]
 TURNSTILE_SITE_KEY = "0x4AAAAAAB4QPl_JmbOFAf6Z"
 ACCESS_AUD = "a19fcd53a38c408af9e08759d726fe4e2d334f93aed63040c3d3fa40a040ec9b"
+DATA_NOTICE = "第三方API数据可能不准确，仅供纪念参考"
+GITHUB_BRANCH = "generated-pages"
+GITHUB_PAGES_PREFIX = "generated"
 
 [[r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -15,12 +18,24 @@ bucket_name = "remember-data"
 binding = "REMEMBER_KV"
 id = "931cf5977880499b818e9318f8122de9"
 
+[[queues.producers]]
+binding = "ANALYSIS_QUEUE"
+queue = "remember-analysis"
+
+[[queues.consumers]]
+queue = "remember-analysis"
+max_batch_size = 1
+max_batch_timeout = 3
+
 [env.production]
 routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
 
 [env.production.vars]
 TURNSTILE_SITE_KEY = "0x4AAAAAAB4QPl_JmbOFAf6Z"
 ACCESS_AUD = "a19fcd53a38c408af9e08759d726fe4e2d334f93aed63040c3d3fa40a040ec9b"
+DATA_NOTICE = "第三方API数据可能不准确，仅供纪念参考"
+GITHUB_BRANCH = "generated-pages"
+GITHUB_PAGES_PREFIX = "generated"
 
 [[env.production.r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -29,6 +44,15 @@ bucket_name = "remember-data"
 [[env.production.kv_namespaces]]
 binding = "REMEMBER_KV"
 id = "931cf5977880499b818e9318f8122de9"
+
+[[env.production.queues.producers]]
+binding = "ANALYSIS_QUEUE"
+queue = "remember-analysis"
+
+[[env.production.queues.consumers]]
+queue = "remember-analysis"
+max_batch_size = 1
+max_batch_timeout = 3
 
 [env.production.triggers]
 crons = ["0 4 * * *"]
