@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { UpstreamClient } from "../src/services/upstreamClient.js";
-import { fetchAllVideosByUid, fetchPagedAicuData } from "../src/services/memorialData.js";
+import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData } from "../src/services/memorialData.js";
 
 function jsonResponse(status, data) {
   return new Response(JSON.stringify(data), {
@@ -81,4 +81,28 @@ test("fetchPagedAicuData should truncate when hitting maxItems", async () => {
   const result = await fetchPagedAicuData(client, "danmu", "789", { maxPages: 10, maxItems: 150 });
   assert.equal(result.items.length, 150);
   assert.equal(result.truncated, true);
+});
+
+test("fetchPagedAicuData should support empty zhibodanmu list", async () => {
+  const client = new UpstreamClient({
+    allowedHosts: ["api.aicu.cc"],
+    retries: 0,
+    timeoutMs: 200,
+    fetchImpl: async () =>
+      jsonResponse(200, {
+        code: 0,
+        data: { cursor: { is_end: true, all_count: 0 }, list: [] },
+      }),
+  });
+  const result = await fetchPagedAicuData(client, "zhibodanmu", "900", { maxPages: 10, maxItems: 100 });
+  assert.equal(result.items.length, 0);
+  assert.equal(result.total, 0);
+});
+
+test("estimateRegDateByUid should map uid to expected range", () => {
+  assert.equal(estimateRegDateByUid(999999).estimatedRange, "2009-2012");
+  assert.equal(estimateRegDateByUid(5_000_000).estimatedRange, "2013-2016");
+  assert.equal(estimateRegDateByUid(30_000_000).estimatedRange, "2017-2019");
+  assert.equal(estimateRegDateByUid(80_000_000).estimatedRange, "2020-2022");
+  assert.equal(estimateRegDateByUid(300_000_000).estimatedRange, "2023+");
 });

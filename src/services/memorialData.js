@@ -54,12 +54,19 @@ async function fetchAicuByPage(client, source, uid, page, keyword = "") {
       { schema: (payload) => payload && typeof payload === "object" },
     );
   }
+  if (source === "zhibodanmu") {
+    return client.requestJson(
+      `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`,
+      { schema: (payload) => payload && typeof payload === "object" },
+    );
+  }
   throw new UpstreamError("未知的 AICU 数据源", { source });
 }
 
 function extractAicuPage(source, data) {
   if (source === "comment") return toSafeArray(data?.data?.replies);
   if (source === "danmu") return toSafeArray(data?.data?.videodmlist);
+  if (source === "zhibodanmu") return toSafeArray(data?.data?.list);
   return [];
 }
 
@@ -99,5 +106,55 @@ export async function fetchPagedAicuData(client, source, uid, options = {}) {
     fetchedPages: page,
     truncated,
     items: items.slice(0, maxItems),
+  };
+}
+
+export function estimateRegDateByUid(uidInput) {
+  const uid = Number(uidInput);
+  if (!Number.isFinite(uid) || uid <= 0) {
+    return {
+      uid: String(uidInput ?? ""),
+      estimatedRange: "未知",
+      confidence: "low",
+      note: "UID 不合法，无法估算注册时间",
+    };
+  }
+  if (uid <= 1_000_000) {
+    return {
+      uid: String(uid),
+      estimatedRange: "2009-2012",
+      confidence: "low",
+      note: "基于 UID 段位估算，误差可能半年以上",
+    };
+  }
+  if (uid <= 10_000_000) {
+    return {
+      uid: String(uid),
+      estimatedRange: "2013-2016",
+      confidence: "low",
+      note: "基于 UID 段位估算，误差可能半年以上",
+    };
+  }
+  if (uid <= 50_000_000) {
+    return {
+      uid: String(uid),
+      estimatedRange: "2017-2019",
+      confidence: "low",
+      note: "基于 UID 段位估算，误差可能半年以上",
+    };
+  }
+  if (uid <= 200_000_000) {
+    return {
+      uid: String(uid),
+      estimatedRange: "2020-2022",
+      confidence: "low",
+      note: "基于 UID 段位估算，误差可能半年以上",
+    };
+  }
+  return {
+    uid: String(uid),
+    estimatedRange: "2023+",
+    confidence: "low",
+    note: "基于 UID 段位估算，误差可能半年以上",
   };
 }
