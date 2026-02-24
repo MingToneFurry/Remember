@@ -1,4 +1,11 @@
-name = "rememberPages"
-main = "worker.js"
+name = "remember-pages"
+main = "workers.js"
 compatibility_date = "2026-01-15"
 
+[[r2_buckets]]
+binding = "REMEMBER_DATA"
+bucket_name = "remember-data"
+
+[[kv_namespaces]]
+binding = "REMEMBER_KV"
+id = "00000000000000000000000000000000"

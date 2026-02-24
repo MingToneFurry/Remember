@@ -15,3 +15,6 @@
 *.log
 *.tmp
 *.temp
+
+# Local package directory created by tooling
+node_modules/
