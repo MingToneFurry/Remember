@@ -4,6 +4,11 @@ function toSafeArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function toNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export async function fetchAllVideosByUid(client, uid, options = {}) {
   const maxPages = Math.max(1, Number(options.maxPages) || 200);
   const pageSize = Math.max(1, Math.min(50, Number(options.pageSize) || 50));
@@ -157,4 +162,46 @@ export function estimateRegDateByUid(uidInput) {
     confidence: "low",
     note: "基于 UID 段位估算，误差可能半年以上",
   };
+}
+
+async function runWithConcurrency(items, concurrency, handler) {
+  const max = Math.max(1, Number(concurrency) || 1);
+  const out = new Array(items.length);
+  let index = 0;
+  const workers = Array.from({ length: Math.min(max, items.length) }, async () => {
+    while (index < items.length) {
+      const current = index;
+      index += 1;
+      out[current] = await handler(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+export async function fetchTopVideoInfosByPlayCount(client, videos, options = {}) {
+  const topN = Math.max(1, Number(options.topN) || 10);
+  const concurrency = Math.max(1, Number(options.concurrency) || 3);
+  const sorted = toSafeArray(videos)
+    .filter((item) => item && typeof item === "object")
+    .sort((a, b) => toNumber(b.play_count ?? b.play ?? b?.stat?.view) - toNumber(a.play_count ?? a.play ?? a?.stat?.view))
+    .slice(0, topN);
+
+  const infos = await runWithConcurrency(sorted, concurrency, async (video) => {
+    const bvid = String(video.bvid || "").trim();
+    const aid = String(video.aid || "").trim();
+    if (!bvid && !aid) return null;
+    const query = bvid ? `bvid=${encodeURIComponent(bvid)}` : `aid=${encodeURIComponent(aid)}`;
+    const { data } = await client.requestJson(`https://uapis.cn/api/v1/social/bilibili/view?${query}`, {
+      schema: (payload) => payload && typeof payload === "object",
+    });
+    return {
+      bvid: bvid || String(data?.bvid || ""),
+      aid: aid || String(data?.aid || ""),
+      playCount: toNumber(video.play_count ?? video.play ?? data?.stat?.view),
+      data,
+    };
+  });
+
+  return infos.filter(Boolean);
 }

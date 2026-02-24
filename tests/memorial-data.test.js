@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { UpstreamClient } from "../src/services/upstreamClient.js";
-import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData } from "../src/services/memorialData.js";
+import {
+  estimateRegDateByUid,
+  fetchAllVideosByUid,
+  fetchPagedAicuData,
+  fetchTopVideoInfosByPlayCount,
+} from "../src/services/memorialData.js";
 
 function jsonResponse(status, data) {
   return new Response(JSON.stringify(data), {
@@ -105,4 +110,35 @@ test("estimateRegDateByUid should map uid to expected range", () => {
   assert.equal(estimateRegDateByUid(30_000_000).estimatedRange, "2017-2019");
   assert.equal(estimateRegDateByUid(80_000_000).estimatedRange, "2020-2022");
   assert.equal(estimateRegDateByUid(300_000_000).estimatedRange, "2023+");
+});
+
+test("fetchTopVideoInfosByPlayCount should select topN and respect concurrency", async () => {
+  const videos = [
+    { bvid: "BV1111111111", play_count: 100 },
+    { bvid: "BV2222222222", play_count: 900 },
+    { bvid: "BV3333333333", play_count: 500 },
+    { bvid: "BV4444444444", play_count: 300 },
+  ];
+  let active = 0;
+  let maxActive = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["uapis.cn"],
+    retries: 0,
+    timeoutMs: 500,
+    fetchImpl: async (url) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      active -= 1;
+      const bvid = new URL(url).searchParams.get("bvid");
+      return jsonResponse(200, { bvid, aid: 123, stat: { view: 1 } });
+    },
+  });
+
+  const infos = await fetchTopVideoInfosByPlayCount(client, videos, { topN: 3, concurrency: 2 });
+  assert.equal(infos.length, 3);
+  assert.equal(infos[0].bvid, "BV2222222222");
+  assert.equal(infos[1].bvid, "BV3333333333");
+  assert.equal(infos[2].bvid, "BV4444444444");
+  assert.equal(maxActive <= 2, true);
 });
