@@ -9,7 +9,7 @@ if (syntax.status !== 0) {
   process.exit(syntax.status ?? 1);
 }
 
-const unit = spawnSync("node", ["--test", "tests/upstream-client.test.js"], {
+const unit = spawnSync("node", ["--test", "tests/upstream-client.test.js", "tests/memorial-data.test.js"], {
   stdio: "inherit",
   shell: process.platform === "win32",
 });
