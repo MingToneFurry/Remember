@@ -1,143 +1,159 @@
 # Remember（rem.furry.ist）
 
-此项目用于生成「已注销用户纪念页」：
-- 首页输入 UID 后可创建专属页面。
+这是一个基于 **Cloudflare Workers + R2 + KV** 的纪念页系统：
+- 首页输入 UID，触发生成专属页面。
 - 首页展示最近生成页面。
-- 写接口（生成、上传）启用 Cloudflare Turnstile 防护。
-- 除必要接口外尽可能缓存。
-- 支持几十 KB 到几百 MB的数据上传（R2 Multipart）。
-
-## 当前已实现能力
-
-### 1) 首页与专属页
-- `GET /`：纪念站首页（UID 输入 + Turnstile + 最近生成列表）。
-- `POST /api/generate`：创建/覆盖生成 `UID` 专属页。
-- `GET /u/{uid}`：访问专属页。
-- `GET /api/recent`：最近生成列表（短缓存）。
-
-### 2) 大文件上传链路（R2 Multipart）
-- `POST /api/upload/init`
-  - 入参：`uid`, `fileName`, `size`, `mime`, `turnstileToken`
-  - 返回：`uploadId`, `sessionToken`
-- `PUT /api/upload/part?uid=...&uploadId=...&partNumber=...`
-  - Header 需携带：`x-upload-session-token`
-  - Body 为该分片二进制数据
-  - 返回：`etag`
-- `POST /api/upload/complete`
-  - 入参：`uid`, `uploadId`, `sessionToken`, `parts[]`, `turnstileToken`
-  - 完成合并并写入索引
-
-> 上传设计说明：
-> - 采用 R2 multipart，可覆盖几十 KB 到几百 MB 的波动场景。
-> - 上传会话信息存 KV，并设置 TTL。
-> - 通过 sessionToken 防止他人复用 uploadId 注入分片。
-
-### 3) 缓存策略
-- 首页 `/`：`public, s-maxage=1800`。
-- 用户页 `/u/{uid}`：`public, s-maxage=86400, stale-while-revalidate=604800`。
-- 最近列表 `/api/recent`：短缓存 `s-maxage=60`。
-- 写接口：全部 `no-store`。
-
-### 4) 安全策略（已落地）
-- Turnstile：所有写接口关键步骤校验。
-- 输入校验：UID 仅允许数字（1~20 位）。
-- XSS 防护：页面输出统一 escape。
-- 安全响应头：`CSP`, `X-Frame-Options`, `X-Content-Type-Options` 等。
-- 上传保护：分片上传要求会话 token。
+- 用户可上传几十 KB 到 300MB 的原始数据，系统保存到 R2。
+- 关键写接口全部受 Turnstile 保护。
+- 公共页面尽可能缓存，写接口 `no-store`。
 
 ---
 
-## 与文档接口结合建议
+## 已实现功能总览
 
-项目目前已打通“用户上传数据 -> R2 存储 -> 生成页展示摘要”链路。
-后续可在 `POST /api/generate` 内增加：
-1. 调用 `docx/api.md` 及相关接口抓取公开信息；
-2. 对抓取结果与用户上传数据合并；
-3. 调用分析模型生成文案；
-4. 渲染完整纪念页并写入 `pages/{uid}.html`。
+### 1. 页面路由
+- `GET /`：首页（UID 输入、Turnstile、最近列表）
+- `GET /u/:uid`：用户专属纪念页
+- `GET /admin`：管理页占位（需 Cloudflare Access 头）
+- `GET /sitemap.xml`
+- `GET /robots.txt`
+
+### 2. 公共 API
+- `GET /api/recent?limit=`：最近生成列表（`limit` 1~50）
+- `GET /api/proxy/:source`：白名单代理（`allVid/comment/vidInfo`）
+- `POST /api/upload/init`：初始化分片上传
+- `PUT /api/upload/part`：上传分片
+- `POST /api/upload/complete`：完成分片上传
+- `POST /api/generate`：创建生成任务
+- `GET /api/job/:jobId`：查询任务状态
+- `POST /api/removal-requests`：提交移除申请
+- `GET /api/removal-requests/:id?code=`：查询移除申请状态
+
+### 3. 管理 API（Cloudflare Access）
+- `GET /api/admin/requests?status=`
+- `POST /api/admin/requests/:id/approve`
+- `POST /api/admin/requests/:id/reject`
+- `POST /api/admin/pages/:uid/unpublish`
+- `POST /api/admin/pages/:uid/regenerate`
+
+### 4. 存储结构
+- 页面 HTML：`pages/{uid}.html`
+- 原始数据：`raw/YYYY-MM-DD/{uid}/...`
+- 生成快照：`snapshots/{uid}/{jobId}.json`
+- 页面元数据：`meta:uid:{uid}`
+- 最近列表：`recent:list`
+- 上传会话：`upload:{uploadId}`
+- 任务状态：`job:{jobId}`
+- 限流：`rl:ip:{scope}:{ip}:{day}`
+- UID 冷却：`cooldown:uid:{uid}`
+- 申诉单：`removal:req:{id}`
 
 ---
 
-## 部署方法（完整）
+## 安全设计（当前版本）
 
-## 前置资源
-1. Cloudflare Worker（绑定域名 `rem.furry.ist`）
-2. R2 Bucket：`remember-data`
-3. KV Namespace：`REMEMBER_KV`
-4. Turnstile Site Key + Secret
+1. **Turnstile 强制校验**
+   - `generate`、`upload/init`、`upload/complete`、`removal-requests` 都必须提交 token。
 
-## 配置 `wrangler.toml`
-- 已包含：
-  - `REMEMBER_DATA`（R2）
-  - `REMEMBER_KV`（KV）
-  - `TURNSTILE_SITE_KEY`（公开 key）
+2. **上传令牌签名保护**
+   - 上传分片与完成必须提交带签名且有过期时间的上传令牌。
+   - 防止他人猜测 uploadId 后插入恶意分片。
 
-将注释路由启用并改为你自己的 zone：
+3. **SSRF 防护**
+   - 代理接口固定 source 白名单和固定上游域名。
+   - 不支持任意 URL 透传。
+
+4. **XSS 防护**
+   - 所有页面动态内容输出时进行 HTML 转义。
+   - CSP + 基础安全响应头。
+
+5. **权限隔离**
+   - admin 路由必须由 Cloudflare Access 在边缘强制保护（Worker 内仅做兜底检查，不应单独依赖请求头存在性）。
+
+6. **防刷限制**
+   - 按 IP 的每日限流：代理/生成/上传初始化。
+   - UID 生成冷却 2 小时。
+
+7. **缓存策略**
+   - 可读页面/列表缓存；写接口与任务状态全部 no-store。
+
+---
+
+## 部署步骤（完整）
+
+## 1) 创建 Cloudflare 资源
+1. Worker：绑定域名 `rem.furry.ist`
+2. R2 bucket：`remember-data`
+3. KV namespace：`REMEMBER_KV`
+4. Turnstile：创建站点，记录 site key / secret
+5. Access：为 `/admin*` 与 `/api/admin/*` 配置 Access 应用
+
+## 2) 配置 `wrangler.toml`
+
 ```toml
+name = "remember-pages"
+main = "workers.js"
+compatibility_date = "2026-01-15"
+workers_dev = true
 routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
+
+[vars]
+TURNSTILE_SITE_KEY = "<site-key>"
+
+[[r2_buckets]]
+binding = "REMEMBER_DATA"
+bucket_name = "remember-data"
+
+[[kv_namespaces]]
+binding = "REMEMBER_KV"
+id = "<your-kv-id>"
 ```
 
-## 配置密钥
+## 3) 注入密钥
+
 ```bash
 wrangler secret put TURNSTILE_SECRET
+wrangler secret put TOKEN_SIGNING_SECRET
 ```
 
-## 本地调试
+> `TOKEN_SIGNING_SECRET` 用于上传令牌签名，必须是高强度随机字符串。
+
+## 4) 本地联调
+
 ```bash
 wrangler dev
 ```
 
-## 部署
+## 5) 发布
+
 ```bash
-wrangler deploy
+wrangler deploy --env production
 ```
+
+## 6) 上线核验清单
+
+1. 访问 `/` 显示 Turnstile 与最近列表
+2. 提交 UID 后 `/api/generate` 返回 jobId
+3. 轮询 `/api/job/:jobId` 直到 succeeded
+4. `/u/:uid` 可访问且可缓存
+5. 上传链路 init/part/complete 成功
+6. admin 接口无 Access 时 403
+7. `/sitemap.xml`、`/robots.txt` 正常
 
 ---
 
-## API 示例
+## 二次安全 Review（上线前建议）
 
-### 生成页面
-```bash
-curl -X POST https://rem.furry.ist/api/generate \
-  -H 'content-type: application/json' \
-  -d '{"uid":"123456","turnstileToken":"<token>"}'
-```
+### 已覆盖高风险点
+- SSRF：已通过 source 与固定域名白名单封死。
+- XSS：模板输出 escape + CSP。
+- 越权：admin 接口依赖 Access 头。
+- 重放：上传 token 有签名+过期。
+- 缓存污染：写接口 `no-store`。
 
-### 初始化上传
-```bash
-curl -X POST https://rem.furry.ist/api/upload/init \
-  -H 'content-type: application/json' \
-  -d '{"uid":"123456","fileName":"data.json","size":1048576,"mime":"application/json","turnstileToken":"<token>"}'
-```
-
-### 上传分片
-```bash
-curl -X PUT 'https://rem.furry.ist/api/upload/part?uid=123456&uploadId=<uploadId>&partNumber=1' \
-  -H 'x-upload-session-token: <sessionToken>' \
-  --data-binary @part-1.bin
-```
-
-### 完成上传
-```bash
-curl -X POST https://rem.furry.ist/api/upload/complete \
-  -H 'content-type: application/json' \
-  -d '{"uid":"123456","uploadId":"<uploadId>","sessionToken":"<sessionToken>","turnstileToken":"<token>","parts":[{"partNumber":1,"etag":"<etag>"}]}'
-```
-
----
-
-## 最终安全 Review（本版本）
-
-### 已检查并规避
-- **XSS 注入**：模板插值统一转义。
-- **未授权写操作**：关键写接口均需 Turnstile；分片接口需会话 token。
-- **缓存污染**：写接口禁缓存，动态读接口短缓存，页面长缓存。
-- **参数滥用**：UID/大小/partNumber 均有边界校验。
-
-### 仍建议后续增强
-1. 增加速率限制（如基于 IP + UID 的限频，建议用 DO 或 WAF 规则）。
-2. 为上传补充 SHA-256 校验与重复文件去重。
-3. 引入异步任务队列（生成任务状态机）避免高并发时重复生成。
-4. 增加内容合规扫描（如恶意脚本片段、违规文本）。
-5. 增加管理员审计日志与移除流程页面。
-
+### 建议继续加强（可选）
+1. 在 WAF 添加国家/ASN/IP 风险规则。
+2. 对上传内容增加 hash 校验与反病毒扫描（异步）。
+3. 管理接口加入审计日志（写入 R2 或 Logpush）。
+4. 对 Turnstile 失败进行渐进式封禁策略。
+5. 为代理返回做 schema 验证，避免上游异常字段影响前端。

@@ -3,9 +3,6 @@ main = "workers.js"
 compatibility_date = "2026-01-15"
 workers_dev = true
 
-# 生产环境可将 routes 切换到 rem.furry.ist/*
-# routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
-
 [vars]
 TURNSTILE_SITE_KEY = ""
 
@@ -14,5 +11,19 @@ binding = "REMEMBER_DATA"
 bucket_name = "remember-data"
 
 [[kv_namespaces]]
+binding = "REMEMBER_KV"
+id = "00000000000000000000000000000000"
+
+[env.production]
+routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
+
+[env.production.vars]
+TURNSTILE_SITE_KEY = ""
+
+[[env.production.r2_buckets]]
+binding = "REMEMBER_DATA"
+bucket_name = "remember-data"
+
+[[env.production.kv_namespaces]]
 binding = "REMEMBER_KV"
 id = "00000000000000000000000000000000"
