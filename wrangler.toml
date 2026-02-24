@@ -3,8 +3,7 @@ main = "workers.js"
 compatibility_date = "2026-01-15"
 workers_dev = true
 
-# 生产环境可将 routes 切换到 rem.furry.ist/*
-# routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
+routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
 
 [vars]
 TURNSTILE_SITE_KEY = ""
