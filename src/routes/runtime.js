@@ -388,9 +388,13 @@ async function processGenerateJob(env, jobId) {
       regDateEstimate,
     };
     const modelOutput = await analyzeWithGrok(env, upstreamClient, snapshotBase);
+    const warnings = [];
+    if (modelOutput?.source === "fallback" && modelOutput?.reason) {
+      warnings.push(String(modelOutput.reason));
+    }
     const snapshot = { ...snapshotBase, modelOutput };
 
-    await patchJob({ stage: "rendering", progress: 85 });
+    await patchJob({ stage: "rendering", progress: 85, warnings });
     const html = buildPage(uid, snapshot);
     await env.REMEMBER_DATA.put(`pages/${uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } });
     await env.REMEMBER_DATA.put(`snapshots/${uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
@@ -398,8 +402,8 @@ async function processGenerateJob(env, jobId) {
     await env.REMEMBER_KV.put(`meta:uid:${uid}`, JSON.stringify(item));
     await saveRecent(env, item);
 
-    await patchJob({ stage: "syncing", progress: 95 });
-    await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url });
+    await patchJob({ stage: "syncing", progress: 95, warnings });
+    await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url, warnings });
   } catch (err) {
     await patchJob({
       status: "failed",
@@ -592,7 +596,15 @@ async function handleGenerate(request, env, ctx) {
 async function handleJob(env, jobId) {
   const job = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
   if (!job) throw new HttpError(404, "任务不存在");
-  return jsonResponse(job, 200, { "cache-control": "no-store" });
+  const normalized = {
+    ...job,
+    stage: String(job.stage || job.status || "unknown"),
+    progress: Number.isFinite(Number(job.progress)) ? Number(job.progress) : 0,
+    warnings: Array.isArray(job.warnings) ? job.warnings : [],
+    gitSync: job.gitSync ?? null,
+    updatedAt: Number(job.updatedAt || job.createdAt || Date.now()),
+  };
+  return jsonResponse(normalized, 200, { "cache-control": "no-store" });
 }
 
 async function handleRemovalCreate(request, env) {
