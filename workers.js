@@ -1,32 +1,60 @@
-const MAX_UPLOAD_SIZE = 512 * 1024 * 1024; // 512MB
+const DOMAIN = "https://rem.furry.ist";
+const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;
+const PART_SIZE_HINT = 8 * 1024 * 1024;
+const MAX_PARTS = 10000;
 const MAX_RECENT = 50;
+const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
 
-function jsonResponse(data, status = 200, extraHeaders = {}) {
-  const headers = new Headers(extraHeaders);
-  headers.set("content-type", "application/json; charset=utf-8");
-  headers.set("x-content-type-options", "nosniff");
-  headers.set("referrer-policy", "strict-origin-when-cross-origin");
-  headers.set("x-frame-options", "DENY");
-  return new Response(JSON.stringify(data), { status, headers });
+class HttpError extends Error {
+  constructor(status, message, details = undefined) {
+    super(message);
+    this.status = status;
+    this.details = details;
+  }
 }
 
-function htmlResponse(html, status = 200, extraHeaders = {}) {
-  const headers = new Headers(extraHeaders);
-  headers.set("content-type", "text/html; charset=utf-8");
-  headers.set("x-content-type-options", "nosniff");
-  headers.set("referrer-policy", "strict-origin-when-cross-origin");
-  headers.set("x-frame-options", "DENY");
-  headers.set(
+function corsHeaders(origin) {
+  if (!origin) return {};
+  if (origin === DOMAIN || origin === "https://www.rem.furry.ist") {
+    return {
+      "access-control-allow-origin": origin,
+      "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+      "access-control-allow-headers": "content-type,x-upload-token,x-upload-session-token",
+      "access-control-max-age": "86400",
+      vary: "Origin",
+    };
+  }
+  return {};
+}
+
+function securityHeaders(base = {}) {
+  const h = new Headers(base);
+  h.set("x-content-type-options", "nosniff");
+  h.set("x-frame-options", "DENY");
+  h.set("referrer-policy", "strict-origin-when-cross-origin");
+  h.set("permissions-policy", "geolocation=(), microphone=(), camera=()");
+  return h;
+}
+
+function jsonResponse(data, status = 200, headers = {}) {
+  const h = securityHeaders(headers);
+  h.set("content-type", "application/json; charset=utf-8");
+  return new Response(JSON.stringify(data), { status, headers: h });
+}
+
+function htmlResponse(html, status = 200, headers = {}) {
+  const h = securityHeaders(headers);
+  h.set("content-type", "text/html; charset=utf-8");
+  h.set(
     "content-security-policy",
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self';",
+    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self';",
   );
-  return new Response(html, { status, headers });
+  return new Response(html, { status, headers: h });
 }
 
 function normalizeUid(input) {
   const uid = String(input ?? "").trim();
-  if (!/^\d{1,20}$/.test(uid)) return null;
-  return uid;
+  return /^\d{1,20}$/.test(uid) ? uid : null;
 }
 
 function safeText(value) {
@@ -39,390 +67,361 @@ function safeText(value) {
 }
 
 function randomId(prefix = "id") {
-  const arr = new Uint8Array(16);
-  crypto.getRandomValues(arr);
+  const arr = crypto.getRandomValues(new Uint8Array(16));
   return `${prefix}_${Array.from(arr, (n) => n.toString(16).padStart(2, "0")).join("")}`;
 }
 
+async function sha256Text(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function issueSignedToken(env, payload, ttlSeconds) {
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const fullPayload = { ...payload, exp };
+  const body = btoa(JSON.stringify(fullPayload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  const sig = await sha256Text(`${body}.${env.TOKEN_SIGNING_SECRET}`);
+  return `${body}.${sig}`;
+}
+
+async function verifySignedToken(env, token) {
+  if (!token || !token.includes(".")) return null;
+  const [body, sig] = token.split(".", 2);
+  const expected = await sha256Text(`${body}.${env.TOKEN_SIGNING_SECRET}`);
+  if (expected !== sig) return null;
+  const payload = JSON.parse(atob(body.replace(/-/g, "+").replace(/_/g, "/")));
+  if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+  return payload;
+}
+
 async function verifyTurnstile(request, env, token) {
-  if (!env.TURNSTILE_SECRET) {
-    return { ok: false, reason: "TURNSTILE_SECRET 未配置" };
-  }
-  if (!token) {
-    return { ok: false, reason: "缺少 Turnstile token" };
-  }
-
-  const ip = request.headers.get("cf-connecting-ip") ?? "";
-  const formData = new FormData();
-  formData.append("secret", env.TURNSTILE_SECRET);
-  formData.append("response", token);
-  if (ip) formData.append("remoteip", ip);
-
-  const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
-    method: "POST",
-    body: formData,
-  });
-  if (!resp.ok) {
-    return { ok: false, reason: `Turnstile 上游失败(${resp.status})` };
-  }
+  if (!token) throw new HttpError(403, "缺少 Turnstile token");
+  if (!env.TURNSTILE_SECRET) throw new HttpError(500, "服务端 Turnstile 密钥未配置");
+  const fd = new FormData();
+  fd.append("secret", env.TURNSTILE_SECRET);
+  fd.append("response", token);
+  const ip = request.headers.get("cf-connecting-ip");
+  if (ip) fd.append("remoteip", ip);
+  const resp = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", { method: "POST", body: fd });
+  if (!resp.ok) throw new HttpError(502, "Turnstile 校验服务异常");
   const data = await resp.json();
-  if (!data.success) {
-    return { ok: false, reason: "Turnstile 校验失败", details: data["error-codes"] ?? [] };
-  }
-  return { ok: true };
+  if (!data.success) throw new HttpError(403, "Turnstile 校验失败", data["error-codes"] ?? []);
+}
+
+async function enforceIpRateLimit(env, request, scope, maxPerDay) {
+  const ip = request.headers.get("cf-connecting-ip") || "0.0.0.0";
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `rl:ip:${scope}:${ip}:${day}`;
+  const current = Number((await env.REMEMBER_KV.get(key)) || "0") + 1;
+  await env.REMEMBER_KV.put(key, String(current), { expirationTtl: 2 * 24 * 3600 });
+  if (current > maxPerDay) throw new HttpError(429, "请求过于频繁，请明天再试");
+}
+
+function requireAdminAccess(request) {
+  const email = request.headers.get("cf-access-authenticated-user-email");
+  const jwt = request.headers.get("cf-access-jwt-assertion");
+  if (!email || !jwt) throw new HttpError(403, "需要 Cloudflare Access");
 }
 
 function homepageHtml(siteKey) {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Remember · 记忆存档</title>
-  <style>
-    :root { color-scheme: light dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; font-family: "Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;
-      background: linear-gradient(180deg,#f7f9fc,#eef2f7);
-      color: #1e2430;
-    }
-    .container { max-width: 960px; margin: 0 auto; padding: 28px 16px 64px; }
-    .hero, .card { background: rgba(255,255,255,.9); border: 1px solid #dfe5ef; border-radius: 16px; padding: 20px; }
-    .hero h1 { margin: 0 0 8px; font-size: 1.8rem; }
-    .muted { color: #5f6d83; }
-    .grid { display: grid; gap: 16px; margin-top: 16px; }
-    .input-row { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
-    input, button { border-radius: 10px; border: 1px solid #ccd5e3; font-size: 1rem; padding: 10px 12px; }
-    button { background: #2f5bda; color: #fff; border-color: #2f5bda; cursor: pointer; }
-    button:disabled { opacity: .6; cursor: not-allowed; }
-    ul { margin: 0; padding-left: 18px; }
-    .recent-item { margin: 10px 0; }
-    .error { color: #b42318; }
-    .ok { color: #067647; }
-  </style>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
-</head>
-<body>
-  <main class="container">
-    <section class="hero">
-      <h1>记忆存档</h1>
-      <p class="muted">输入 UID，生成专属纪念页。写接口受 Cloudflare Turnstile 保护；公共页面可缓存加速。</p>
-      <div class="grid">
-        <div>
-          <label for="uid">UID</label>
-          <div class="input-row">
-            <input id="uid" type="text" inputmode="numeric" placeholder="例如：123456" maxlength="20" />
-            <button id="generate-btn" type="button">生成专属页</button>
-          </div>
-        </div>
-        <div class="cf-turnstile" data-sitekey="${safeText(siteKey)}"></div>
-        <p id="status" class="muted">等待提交…</p>
-      </div>
-    </section>
-
-    <section class="card" style="margin-top:16px;">
-      <h2 style="margin-top:0;">最近生成</h2>
-      <p class="muted">按时间倒序展示最近生成的页面。</p>
-      <ul id="recent-list"><li class="muted">加载中…</li></ul>
-    </section>
-  </main>
-
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Remember</title>
+  <style>body{font-family:system-ui,-apple-system,sans-serif;background:#f5f7fb;padding:20px}.box{max-width:960px;margin:0 auto;background:#fff;border:1px solid #dfe6f3;border-radius:12px;padding:16px}input,button{padding:10px;border-radius:8px;border:1px solid #c8d3e5}button{background:#2056d8;color:#fff;cursor:pointer}ul{padding-left:18px}</style>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box"><h1>rem.furry.ist 纪念页</h1><p>输入 UID 生成专属页面，上传数据后可增强页面内容。</p>
+  <input id="uid" inputmode="numeric" maxlength="20" placeholder="UID"/><button id="gen">生成页面</button><div class="cf-turnstile" data-sitekey="${safeText(siteKey)}"></div><p id="status"></p>
+  <h2>最近生成</h2><ul id="recent"></ul></div>
   <script>
-    async function loadRecent() {
-      const list = document.getElementById('recent-list');
-      try {
-        const resp = await fetch('/api/recent', { headers: { 'accept': 'application/json' } });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || 'recent failed');
-        if (!Array.isArray(data.items) || data.items.length === 0) {
-          list.innerHTML = '<li class="muted">暂无记录</li>';
-          return;
-        }
-        list.innerHTML = data.items.map(item => {
-          const uid = String(item.uid || '');
-          const created = new Date(item.createdAt || Date.now()).toLocaleString();
-          return '<li class="recent-item"><a href="/u/' + encodeURIComponent(uid) + '">UID ' + uid + '</a> · <span class="muted">' + created + '</span></li>';
-        }).join('');
-      } catch (err) {
-        list.innerHTML = '<li class="error">最近列表加载失败</li>';
-      }
-    }
-
-    async function generatePage() {
-      const uid = document.getElementById('uid').value.trim();
-      const statusEl = document.getElementById('status');
-      const btn = document.getElementById('generate-btn');
-      const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
-      const turnstileToken = tokenInput ? tokenInput.value : '';
-      btn.disabled = true;
-      statusEl.className = 'muted';
-      statusEl.textContent = '正在提交…';
-      try {
-        const resp = await fetch('/api/generate', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ uid, turnstileToken })
-        });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || '生成失败');
-        statusEl.className = 'ok';
-        statusEl.textContent = '生成完成，即将跳转…';
-        await loadRecent();
-        location.href = data.url;
-      } catch (err) {
-        statusEl.className = 'error';
-        statusEl.textContent = err.message;
-      } finally {
-        btn.disabled = false;
-      }
-    }
-
-    document.getElementById('generate-btn').addEventListener('click', generatePage);
-    loadRecent();
-  </script>
-</body>
-</html>`;
+  async function loadRecent(){const r=await fetch('/api/recent');const d=await r.json();const ul=document.getElementById('recent');ul.innerHTML=(d.items||[]).map(i=>'<li><a href="/u/'+encodeURIComponent(i.uid)+'">UID '+i.uid+'</a> · '+new Date(i.createdAt).toLocaleString()+'</li>').join('')||'<li>暂无</li>';}
+  async function gen(){const uid=document.getElementById('uid').value.trim();const token=window.turnstile?.getResponse();const s=document.getElementById('status');s.textContent='处理中...';const r=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken:token})});const d=await r.json();if(!r.ok){s.textContent=d.error||'失败';return;}s.textContent='任务已提交';const jobId=d.jobId;for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1500));const jr=await fetch('/api/job/'+encodeURIComponent(jobId));const jd=await jr.json();if(jd.status==='succeeded'){location.href=jd.url;return;}if(jd.status==='failed'){s.textContent='失败:'+jd.error;return;}}s.textContent='任务超时';}
+  document.getElementById('gen').onclick=gen;loadRecent();
+  </script></body></html>`;
 }
 
 async function getRecent(env) {
-  const raw = await env.REMEMBER_KV.get("recent:index");
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed;
-  } catch {
-    return [];
-  }
+  return (await env.REMEMBER_KV.get("recent:list", "json")) || [];
 }
 
 async function saveRecent(env, item) {
-  const existing = await getRecent(env);
-  const withoutUid = existing.filter((v) => v.uid !== item.uid);
-  const merged = [item, ...withoutUid].slice(0, MAX_RECENT);
-  await env.REMEMBER_KV.put("recent:index", JSON.stringify(merged));
+  const current = await getRecent(env);
+  const merged = [item, ...current.filter((v) => v.uid !== item.uid)].slice(0, MAX_RECENT);
+  await env.REMEMBER_KV.put("recent:list", JSON.stringify(merged));
 }
 
-async function buildMemorialPage(uid, uploadedItems = []) {
-  const rows = uploadedItems.length
-    ? uploadedItems
-        .map(
-          (it) => `<tr><td>${safeText(it.fileName)}</td><td>${safeText(it.size)}</td><td>${safeText(it.mime || "application/octet-stream")}</td></tr>`,
-        )
-        .join("")
-    : '<tr><td colspan="3">暂无用户上传数据，后续可通过上传接口补充。</td></tr>';
-
-  return `<!doctype html>
-<html lang="zh-CN"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>UID ${safeText(uid)} · 纪念页</title>
-<style>
-body{margin:0;padding:24px;background:#f4f6fb;color:#1f2735;font-family:"Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif;}
-.card{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dee4ef;border-radius:16px;padding:22px;}
-h1{margin:0 0 8px;} .muted{color:#5f6d83;} table{width:100%;border-collapse:collapse;margin-top:14px;} th,td{padding:10px;border-bottom:1px solid #e6ebf3;text-align:left;}
-</style></head>
-<body><article class="card">
-<h1>UID ${safeText(uid)} 的纪念页</h1>
-<p class="muted">此页面由用户提交请求生成。若涉及权益，请联系管理员申请移除。</p>
-<h2>已上传的数据摘要</h2>
-<table><thead><tr><th>文件名</th><th>大小(字节)</th><th>MIME</th></tr></thead><tbody>${rows}</tbody></table>
-</article></body></html>`;
+function buildPage(uid, snapshot) {
+  const uploaded = Array.isArray(snapshot?.uploads) ? snapshot.uploads : [];
+  const rows = uploaded.length
+    ? uploaded.map((u) => `<tr><td>${safeText(u.fileName)}</td><td>${safeText(u.size)}</td><td>${safeText(u.mime)}</td></tr>`).join("")
+    : '<tr><td colspan="3">暂无上传数据</td></tr>';
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>UID ${safeText(uid)} 纪念页</title><meta name="viewport" content="width=device-width,initial-scale=1"/><style>body{font-family:system-ui;background:#f4f6fb;padding:20px}.card{max-width:900px;margin:0 auto;background:#fff;border:1px solid #dce4f2;border-radius:12px;padding:16px}table{width:100%;border-collapse:collapse}td,th{border-bottom:1px solid #ecf1f8;padding:8px;text-align:left}</style></head><body><div class="card"><h1>UID ${safeText(uid)} 纪念页</h1><p>页面已生成于 ${new Date(snapshot.createdAt).toLocaleString()}</p><h2>上传数据</h2><table><thead><tr><th>文件名</th><th>大小</th><th>MIME</th></tr></thead><tbody>${rows}</tbody></table></div></body></html>`;
 }
 
-async function handleGenerate(request, env) {
-  const payload = await request.json().catch(() => ({}));
-  const uid = normalizeUid(payload.uid);
-  if (!uid) {
-    return jsonResponse({ error: "uid 不合法" }, 400, { "cache-control": "no-store" });
+async function processGenerateJob(env, jobId) {
+  const jobKey = `job:${jobId}`;
+  const job = await env.REMEMBER_KV.get(jobKey, "json");
+  if (!job || job.status !== "pending") return;
+  job.status = "running";
+  await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 3600 });
+  try {
+    const uploads = (await env.REMEMBER_KV.get(`uploads:index:${job.uid}`, "json")) || [];
+    const snapshot = { uid: job.uid, uploads, createdAt: Date.now() };
+    const html = buildPage(job.uid, snapshot);
+    await env.REMEMBER_DATA.put(`pages/${job.uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } });
+    await env.REMEMBER_DATA.put(`snapshots/${job.uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
+    const item = { uid: job.uid, createdAt: Date.now(), url: `/u/${job.uid}` };
+    await env.REMEMBER_KV.put(`meta:uid:${job.uid}`, JSON.stringify(item));
+    await saveRecent(env, item);
+    job.status = "succeeded";
+    job.url = item.url;
+    await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 86400 });
+  } catch (err) {
+    job.status = "failed";
+    job.error = String(err?.message || err);
+    await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 86400 });
+  }
+}
+
+async function handleProxy(request, env, url) {
+  await enforceIpRateLimit(env, request, "proxy", 60);
+  const source = url.pathname.split("/").pop();
+  const uid = normalizeUid(url.searchParams.get("uid"));
+  const bvid = String(url.searchParams.get("bvid") || "").trim();
+  if (!["allVid", "comment", "vidInfo"].includes(source)) throw new HttpError(400, "source 不合法");
+  if (!uid && !bvid) throw new HttpError(400, "缺少 uid/bvid 参数");
+
+  let upstream;
+  if (source === "allVid") {
+    if (!uid) throw new HttpError(400, "allVid 需要 uid");
+    const pn = Math.max(1, Math.min(200, Number(url.searchParams.get("pn") || "1")));
+    upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${uid}&ps=50&pn=${pn}`;
+  } else if (source === "comment") {
+    const page = Math.max(1, Math.min(1000, Number(url.searchParams.get("page") || "1")));
+    if (!bvid || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new HttpError(400, "comment 需要合法 bvid");
+    upstream = `https://uapis.cn/api/v1/social/bilibili/replies?bvid=${encodeURIComponent(bvid)}&pn=${page}`;
+  } else {
+    if (!bvid || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new HttpError(400, "vidInfo 需要合法 bvid");
+    upstream = `https://uapis.cn/api/v1/social/bilibili/view?bvid=${encodeURIComponent(bvid)}`;
   }
 
-  const turn = await verifyTurnstile(request, env, payload.turnstileToken);
-  if (!turn.ok) {
-    return jsonResponse({ error: turn.reason, details: turn.details ?? [] }, 403, { "cache-control": "no-store" });
-  }
-
-  const uploads = await env.REMEMBER_KV.get(`uploads:index:${uid}`, "json").catch(() => []);
-  const html = await buildMemorialPage(uid, Array.isArray(uploads) ? uploads : []);
-  await env.REMEMBER_DATA.put(`pages/${uid}.html`, html, {
-    httpMetadata: { contentType: "text/html; charset=utf-8" },
-  });
-
-  const item = { uid, createdAt: Date.now() };
-  await env.REMEMBER_KV.put(`page:meta:${uid}`, JSON.stringify(item));
-  await saveRecent(env, item);
-
-  return jsonResponse({ ok: true, url: `/u/${uid}` }, 200, { "cache-control": "no-store" });
+  const r = await fetch(upstream, { cf: { cacheTtl: 0, cacheEverything: false } });
+  const text = await r.text();
+  return new Response(text, { status: r.status, headers: securityHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }) });
 }
 
 async function handleUploadInit(request, env) {
-  const payload = await request.json().catch(() => ({}));
-  const uid = normalizeUid(payload.uid);
-  if (!uid) return jsonResponse({ error: "uid 不合法" }, 400, { "cache-control": "no-store" });
+  const body = await request.json().catch(() => ({}));
+  const uid = normalizeUid(body.uid);
+  if (!uid) throw new HttpError(400, "uid 不合法");
+  const size = Number(body.size || 0);
+  if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_SIZE) throw new HttpError(400, "上传大小不合法");
+  await verifyTurnstile(request, env, body.turnstileToken);
+  await enforceIpRateLimit(env, request, "upload-init", 20);
 
-  const size = Number(payload.size ?? 0);
-  if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_SIZE) {
-    return jsonResponse({ error: `文件大小超限，最大 ${MAX_UPLOAD_SIZE} 字节` }, 400, { "cache-control": "no-store" });
-  }
-
-  const turn = await verifyTurnstile(request, env, payload.turnstileToken);
-  if (!turn.ok) {
-    return jsonResponse({ error: turn.reason, details: turn.details ?? [] }, 403, { "cache-control": "no-store" });
-  }
-
-  const uploadId = randomId("upload");
-  const sessionToken = randomId("sess");
-  const fileName = String(payload.fileName ?? "data.bin").slice(0, 200);
-  const mime = String(payload.mime ?? "application/octet-stream").slice(0, 120);
-
-  const key = `uploads/${uid}/${uploadId}/${fileName}`;
-  const upload = await env.REMEMBER_DATA.createMultipartUpload(key, {
-    httpMetadata: { contentType: mime },
-    customMetadata: { uid, fileName, size: String(size) },
-  });
-
-  await env.REMEMBER_KV.put(
-    `upload:session:${uid}:${upload.uploadId}`,
-    JSON.stringify({ uid, uploadId, key, fileName, mime, size, createdAt: Date.now(), sessionToken }),
-    { expirationTtl: 60 * 60 * 24 },
-  );
-
-  return jsonResponse(
-    {
-      ok: true,
-      uid,
-      uploadId: upload.uploadId,
-      clientUploadId: uploadId,
-      sessionToken,
-      maxPartSizeHint: 8 * 1024 * 1024,
-    },
-    200,
-    { "cache-control": "no-store" },
-  );
-}
-
-async function getUploadSession(env, uid, uploadId) {
-  return env.REMEMBER_KV.get(`upload:session:${uid}:${uploadId}`, "json");
+  const fileName = String(body.fileName || "data.bin").slice(0, 200);
+  const mime = String(body.mime || "application/octet-stream").slice(0, 120);
+  const objectPath = `raw/${new Date().toISOString().slice(0, 10)}/${uid}/${randomId("upload")}-${fileName}`;
+  const upload = await env.REMEMBER_DATA.createMultipartUpload(objectPath, { httpMetadata: { contentType: mime } });
+  const token = await issueSignedToken(env, { uid, uploadId: upload.uploadId }, 24 * 3600);
+  await env.REMEMBER_KV.put(`upload:${upload.uploadId}`, JSON.stringify({ uid, key: objectPath, fileName, mime, size, createdAt: Date.now() }), { expirationTtl: 24 * 3600 });
+  return jsonResponse({ ok: true, uid, uploadId: upload.uploadId, uploadToken: token, maxPartSizeHint: PART_SIZE_HINT }, 200, { "cache-control": "no-store" });
 }
 
 async function handleUploadPart(request, env, url) {
-  const uid = normalizeUid(url.searchParams.get("uid"));
-  const uploadId = url.searchParams.get("uploadId") ?? "";
-  const partNumber = Number(url.searchParams.get("partNumber") ?? 0);
-  const sessionToken = request.headers.get("x-upload-session-token") ?? "";
-
-  if (!uid || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) {
-    return jsonResponse({ error: "参数不合法" }, 400, { "cache-control": "no-store" });
-  }
-
-  const session = await getUploadSession(env, uid, uploadId);
-  if (!session || session.sessionToken !== sessionToken) {
-    return jsonResponse({ error: "上传会话无效" }, 403, { "cache-control": "no-store" });
-  }
-
+  const uploadId = String(url.searchParams.get("uploadId") || "");
+  const partNumber = Number(url.searchParams.get("partNumber") || "0");
+  if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PARTS) throw new HttpError(400, "参数不合法");
+  const token = request.headers.get("x-upload-token") || request.headers.get("x-upload-session-token") || "";
+  const payload = await verifySignedToken(env, token);
+  if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
+  const session = await env.REMEMBER_KV.get(`upload:${uploadId}`, "json");
+  if (!session || session.uid !== payload.uid) throw new HttpError(403, "上传会话无效");
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
-  const part = await multipart.uploadPart(partNumber, request.body);
-  return jsonResponse({ ok: true, partNumber, etag: part.etag }, 200, { "cache-control": "no-store" });
+  const p = await multipart.uploadPart(partNumber, request.body);
+  return jsonResponse({ ok: true, partNumber, etag: p.etag }, 200, { "cache-control": "no-store" });
 }
 
 async function handleUploadComplete(request, env) {
-  const payload = await request.json().catch(() => ({}));
-  const uid = normalizeUid(payload.uid);
-  const uploadId = String(payload.uploadId ?? "");
-  const sessionToken = String(payload.sessionToken ?? "");
-  const parts = Array.isArray(payload.parts) ? payload.parts : [];
-
-  if (!uid || !uploadId || !sessionToken || parts.length === 0) {
-    return jsonResponse({ error: "参数不完整" }, 400, { "cache-control": "no-store" });
-  }
-
-  const turn = await verifyTurnstile(request, env, payload.turnstileToken);
-  if (!turn.ok) {
-    return jsonResponse({ error: turn.reason, details: turn.details ?? [] }, 403, { "cache-control": "no-store" });
-  }
-
-  const session = await getUploadSession(env, uid, uploadId);
-  if (!session || session.sessionToken !== sessionToken) {
-    return jsonResponse({ error: "上传会话无效" }, 403, { "cache-control": "no-store" });
-  }
+  const body = await request.json().catch(() => ({}));
+  const uploadId = String(body.uploadId || "");
+  const parts = Array.isArray(body.parts) ? body.parts : [];
+  if (!uploadId || parts.length === 0) throw new HttpError(400, "参数不完整");
+  await verifyTurnstile(request, env, body.turnstileToken);
+  const payload = await verifySignedToken(env, body.uploadToken || body.sessionToken || "");
+  if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
+  const session = await env.REMEMBER_KV.get(`upload:${uploadId}`, "json");
+  if (!session) throw new HttpError(404, "上传会话不存在");
 
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
-  await multipart.complete(
-    parts.map((p) => ({ partNumber: Number(p.partNumber), etag: String(p.etag) })),
-  );
-
-  const item = {
-    uploadId,
-    key: session.key,
-    fileName: session.fileName,
-    mime: session.mime,
-    size: session.size,
-    createdAt: Date.now(),
-  };
-  const indexKey = `uploads:index:${uid}`;
-  const current = (await env.REMEMBER_KV.get(indexKey, "json").catch(() => [])) || [];
-  const merged = [...current, item].slice(-100);
-  await env.REMEMBER_KV.put(indexKey, JSON.stringify(merged));
-  await env.REMEMBER_KV.delete(`upload:session:${uid}:${uploadId}`);
-
-  return jsonResponse({ ok: true, item }, 200, { "cache-control": "no-store" });
+  await multipart.complete(parts.map((x) => ({ partNumber: Number(x.partNumber), etag: String(x.etag) })));
+  const idxKey = `uploads:index:${session.uid}`;
+  const list = (await env.REMEMBER_KV.get(idxKey, "json")) || [];
+  list.push({ uploadId, key: session.key, fileName: session.fileName, mime: session.mime, size: session.size, createdAt: Date.now() });
+  await env.REMEMBER_KV.put(idxKey, JSON.stringify(list.slice(-200)));
+  await env.REMEMBER_KV.delete(`upload:${uploadId}`);
+  return jsonResponse({ ok: true }, 200, { "cache-control": "no-store" });
 }
 
-async function handleFetch(request, env) {
+async function handleGenerate(request, env, ctx) {
+  const body = await request.json().catch(() => ({}));
+  const uid = normalizeUid(body.uid);
+  if (!uid) throw new HttpError(400, "uid 不合法");
+  await verifyTurnstile(request, env, body.turnstileToken);
+  await enforceIpRateLimit(env, request, "generate", 5);
+
+  const cooldownKey = `cooldown:uid:${uid}`;
+  const existingCooldown = await env.REMEMBER_KV.get(cooldownKey);
+  if (existingCooldown) throw new HttpError(429, "该 UID 处于冷却期，请稍后重试");
+  await env.REMEMBER_KV.put(cooldownKey, "1", { expirationTtl: UID_COOLDOWN_SECONDS });
+
+  const jobId = randomId("job");
+  await env.REMEMBER_KV.put(`job:${jobId}`, JSON.stringify({ jobId, uid, status: "pending", createdAt: Date.now() }), { expirationTtl: 3600 });
+  ctx.waitUntil(processGenerateJob(env, jobId));
+  return jsonResponse({ ok: true, jobId }, 202, { "cache-control": "no-store" });
+}
+
+async function handleJob(env, jobId) {
+  const job = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+  if (!job) throw new HttpError(404, "任务不存在");
+  return jsonResponse(job, 200, { "cache-control": "no-store" });
+}
+
+async function handleRemovalCreate(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const uid = normalizeUid(body.uid);
+  if (!uid) throw new HttpError(400, "uid 不合法");
+  await verifyTurnstile(request, env, body.turnstileToken);
+  const id = randomId("rr");
+  const code = randomId("code");
+  await env.REMEMBER_KV.put(`removal:req:${id}`, JSON.stringify({ id, uid, reason: String(body.reason || "").slice(0, 1000), status: "pending", code, createdAt: Date.now() }));
+  return jsonResponse({ ok: true, id, queryCode: code }, 200, { "cache-control": "no-store" });
+}
+
+async function handleRemovalGet(env, url) {
+  const parts = url.pathname.split("/");
+  const id = parts[parts.length - 1];
+  const code = String(url.searchParams.get("code") || "");
+  const req = await env.REMEMBER_KV.get(`removal:req:${id}`, "json");
+  if (!req || req.code !== code) throw new HttpError(403, "查询码错误");
+  return jsonResponse({ id: req.id, uid: req.uid, status: req.status, createdAt: req.createdAt }, 200, { "cache-control": "no-store" });
+}
+
+async function handleAdmin(request, env, url, ctx) {
+  requireAdminAccess(request);
+  if (request.method === "GET" && url.pathname === "/admin") {
+    return htmlResponse("<h1>Admin</h1><p>可通过 /api/admin/* 使用管理接口。</p>", 200, { "cache-control": "no-store" });
+  }
+  if (request.method === "GET" && url.pathname === "/api/admin/requests") {
+    const status = String(url.searchParams.get("status") || "pending");
+    const list = await env.REMEMBER_KV.list({ prefix: "removal:req:" });
+    const out = [];
+    for (const k of list.keys) {
+      const v = await env.REMEMBER_KV.get(k.name, "json");
+      if (v && (!status || v.status === status)) out.push({ id: v.id, uid: v.uid, status: v.status, createdAt: v.createdAt });
+    }
+    return jsonResponse({ items: out }, 200, { "cache-control": "no-store" });
+  }
+  const reqMatch = url.pathname.match(/^\/api\/admin\/requests\/([^/]+)\/(approve|reject)$/);
+  if (request.method === "POST" && reqMatch) {
+    const id = reqMatch[1];
+    const action = reqMatch[2];
+    const key = `removal:req:${id}`;
+    const reqObj = await env.REMEMBER_KV.get(key, "json");
+    if (!reqObj) throw new HttpError(404, "申请不存在");
+    reqObj.status = action === "approve" ? "approved" : "rejected";
+    await env.REMEMBER_KV.put(key, JSON.stringify(reqObj));
+    if (action === "approve") {
+      await env.REMEMBER_DATA.delete(`pages/${reqObj.uid}.html`);
+      await env.REMEMBER_KV.delete(`meta:uid:${reqObj.uid}`);
+    }
+    return jsonResponse({ ok: true, status: reqObj.status }, 200, { "cache-control": "no-store" });
+  }
+  const unpublishMatch = url.pathname.match(/^\/api\/admin\/pages\/([^/]+)\/unpublish$/);
+  if (request.method === "POST" && unpublishMatch) {
+    const uid = normalizeUid(unpublishMatch[1]);
+    if (!uid) throw new HttpError(400, "uid 不合法");
+    await env.REMEMBER_DATA.delete(`pages/${uid}.html`);
+    await env.REMEMBER_KV.delete(`meta:uid:${uid}`);
+    return jsonResponse({ ok: true }, 200, { "cache-control": "no-store" });
+  }
+  const regenMatch = url.pathname.match(/^\/api\/admin\/pages\/([^/]+)\/regenerate$/);
+  if (request.method === "POST" && regenMatch) {
+    const uid = normalizeUid(regenMatch[1]);
+    if (!uid) throw new HttpError(400, "uid 不合法");
+    const jobId = randomId("job");
+    await env.REMEMBER_KV.put(`job:${jobId}`, JSON.stringify({ jobId, uid, status: "pending", createdAt: Date.now() }), { expirationTtl: 3600 });
+    ctx.waitUntil(processGenerateJob(env, jobId));
+    return jsonResponse({ ok: true, jobId }, 202, { "cache-control": "no-store" });
+  }
+  throw new HttpError(404, "admin route not found");
+}
+
+async function sitemapXml(env) {
+  const list = await env.REMEMBER_KV.list({ prefix: "meta:uid:" });
+  const urls = [];
+  for (const item of list.keys) {
+    const uid = item.name.slice("meta:uid:".length);
+    if (normalizeUid(uid)) urls.push(`<url><loc>${DOMAIN}/u/${uid}</loc></url>`);
+  }
+  return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${DOMAIN}/</loc></url>${urls.join("")}</urlset>`;
+}
+
+async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
+  const cors = corsHeaders(request.headers.get("origin"));
 
-  if (request.method === "GET" && path === "/") {
-    return htmlResponse(homepageHtml(env.TURNSTILE_SITE_KEY ?? ""), 200, {
-      "cache-control": "public, s-maxage=1800, stale-while-revalidate=86400",
-    });
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
+
+  try {
+    if (request.method === "GET" && path === "/") return htmlResponse(homepageHtml(env.TURNSTILE_SITE_KEY || ""), 200, { ...cors, "cache-control": "public, s-maxage=300" });
+    if (request.method === "GET" && path === "/robots.txt") return new Response("User-agent: *\nAllow: /\nSitemap: https://rem.furry.ist/sitemap.xml\n", { headers: { ...cors, "content-type": "text/plain; charset=utf-8", "cache-control": "public, s-maxage=86400" } });
+    if (request.method === "GET" && path === "/sitemap.xml") return new Response(await sitemapXml(env), { headers: { ...cors, "content-type": "application/xml; charset=utf-8", "cache-control": "public, s-maxage=3600" } });
+
+    if (request.method === "GET" && path.startsWith("/u/")) {
+      const uid = normalizeUid(path.slice(3));
+      if (!uid) throw new HttpError(404, "not found");
+      const obj = await env.REMEMBER_DATA.get(`pages/${uid}.html`);
+      if (!obj) throw new HttpError(404, "not found");
+      return new Response(await obj.text(), { headers: { ...cors, "content-type": "text/html; charset=utf-8", "cache-control": "public, s-maxage=86400, stale-while-revalidate=604800" } });
+    }
+
+    if (request.method === "GET" && path === "/api/recent") return jsonResponse({ items: await getRecent(env) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
+    if (request.method === "GET" && path.startsWith("/api/proxy/")) return handleProxy(request, env, url);
+    if (request.method === "POST" && path === "/api/upload/init") return handleUploadInit(request, env);
+    if (request.method === "PUT" && path === "/api/upload/part") return handleUploadPart(request, env, url);
+    if (request.method === "POST" && path === "/api/upload/complete") return handleUploadComplete(request, env);
+    if (request.method === "POST" && path === "/api/generate") return handleGenerate(request, env, ctx);
+    if (request.method === "GET" && path.startsWith("/api/job/")) return handleJob(env, path.split("/").pop());
+    if (request.method === "POST" && path === "/api/removal-requests") return handleRemovalCreate(request, env);
+    if (request.method === "GET" && path.startsWith("/api/removal-requests/")) return handleRemovalGet(env, url);
+    if (path === "/admin" || path.startsWith("/api/admin/")) return handleAdmin(request, env, url, ctx);
+
+    throw new HttpError(404, "Not Found");
+  } catch (err) {
+    if (err instanceof HttpError) return jsonResponse({ error: err.message, details: err.details || [] }, err.status, { ...cors, "cache-control": "no-store" });
+    return jsonResponse({ error: "Internal Error", details: [String(err?.message || err)] }, 500, { ...cors, "cache-control": "no-store" });
   }
+}
 
-  if (request.method === "GET" && path.startsWith("/u/")) {
-    const uid = normalizeUid(path.slice(3));
-    if (!uid) return htmlResponse("<h1>404</h1>", 404, { "cache-control": "no-store" });
-
-    const obj = await env.REMEMBER_DATA.get(`pages/${uid}.html`);
-    if (!obj) return htmlResponse("<h1>404</h1><p>页面不存在</p>", 404, { "cache-control": "no-store" });
-
-    return new Response(await obj.text(), {
-      status: 200,
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "public, s-maxage=86400, stale-while-revalidate=604800",
-        "x-content-type-options": "nosniff",
-      },
-    });
+async function handleScheduled(event, env) {
+  const now = Date.now();
+  const sevenDaysAgo = now - 7 * 24 * 3600 * 1000;
+  const list = await env.REMEMBER_DATA.list({ prefix: "raw/" });
+  for (const obj of list.objects) {
+    if (obj.uploaded.getTime() < sevenDaysAgo) {
+      await env.REMEMBER_DATA.delete(obj.key);
+    }
   }
-
-  if (request.method === "GET" && path === "/api/recent") {
-    const items = await getRecent(env);
-    return jsonResponse({ items }, 200, {
-      "cache-control": "public, s-maxage=60, stale-while-revalidate=120",
-    });
+  const kvUploads = await env.REMEMBER_KV.list({ prefix: "upload:" });
+  for (const key of kvUploads.keys) {
+    const v = await env.REMEMBER_KV.get(key.name, "json");
+    if (v && v.createdAt && now - v.createdAt > 24 * 3600 * 1000) await env.REMEMBER_KV.delete(key.name);
   }
-
-  if (request.method === "POST" && path === "/api/generate") {
-    return handleGenerate(request, env);
-  }
-
-  if (request.method === "POST" && path === "/api/upload/init") {
-    return handleUploadInit(request, env);
-  }
-
-  if (request.method === "PUT" && path === "/api/upload/part") {
-    return handleUploadPart(request, env, url);
-  }
-
-  if (request.method === "POST" && path === "/api/upload/complete") {
-    return handleUploadComplete(request, env);
-  }
-
-  return jsonResponse({ error: "Not Found" }, 404, { "cache-control": "no-store" });
 }
 
 export default {
-  async fetch(request, env) {
-    return handleFetch(request, env);
+  fetch(request, env, ctx) {
+    return handleFetch(request, env, ctx);
+  },
+  scheduled(event, env, ctx) {
+    ctx.waitUntil(handleScheduled(event, env));
   },
 };
