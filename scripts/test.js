@@ -11,7 +11,13 @@ if (syntax.status !== 0) {
 
 const unit = spawnSync(
   "node",
-  ["--test", "tests/upstream-client.test.js", "tests/memorial-data.test.js", "tests/grok-analyzer.test.js"],
+  [
+    "--test",
+    "tests/upstream-client.test.js",
+    "tests/memorial-data.test.js",
+    "tests/grok-analyzer.test.js",
+    "tests/template-xss.test.js",
+  ],
   {
   stdio: "inherit",
   shell: process.platform === "win32",
