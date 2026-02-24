@@ -1,0 +1,87 @@
+name: Deploy Generated Pages
+
+on:
+  push:
+    branches:
+      - generated-pages
+    paths:
+      - "generated/**"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Deploy worker to Cloudflare
+        run: npx wrangler deploy --env production
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Build cache purge payload
+        id: purge_builder
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+
+          before = (os.getenv("BEFORE_SHA") or "").strip()
+          after = (os.getenv("AFTER_SHA") or "").strip()
+          zero = "0" * 40
+
+          if before and before != zero:
+              cmd = ["git", "diff", "--name-only", before, after, "--", "generated"]
+          else:
+              cmd = ["git", "ls-files", "generated"]
+
+          files = subprocess.check_output(cmd, text=True).splitlines()
+          urls = set()
+          for path in files:
+              if path.startswith("generated/pages/") and path.endswith(".html"):
+                  uid = path[len("generated/pages/"):-len(".html")]
+                  if uid.isdigit():
+                      urls.add(f"https://rem.furry.ist/u/{uid}")
+              elif path == "generated/recent.json":
+                  urls.add("https://rem.furry.ist/")
+              elif path == "generated/sitemap.xml":
+                  urls.add("https://rem.furry.ist/sitemap.xml")
+
+          payload = {"files": sorted(urls)}
+          with open("purge_payload.json", "w", encoding="utf-8") as fp:
+              json.dump(payload, fp)
+          print(json.dumps(payload))
+          print(f"count={len(payload['files'])}")
+          PY
+
+          echo "purge_count=$(python -c \"import json;print(len(json.load(open('purge_payload.json'))['files']))\")" >> "$GITHUB_OUTPUT"
+
+      - name: Purge changed URLs from Cloudflare cache
+        if: steps.purge_builder.outputs.purge_count != '0'
+        run: |
+          curl --fail --show-error --silent \
+            -X POST "https://api.cloudflare.com/client/v4/zones/${{ secrets.CLOUDFLARE_ZONE_ID }}/purge_cache" \
+            -H "Authorization: Bearer ${{ secrets.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            --data @purge_payload.json
