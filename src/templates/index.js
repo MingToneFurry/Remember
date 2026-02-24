@@ -1,0 +1,1 @@
+﻿export const TEMPLATES_LAYER = 'worker-templates';

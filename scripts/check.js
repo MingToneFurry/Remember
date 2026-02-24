@@ -14,6 +14,6 @@ function assertContains(path, needle) {
 assertReadable("workers.js");
 assertReadable("wrangler.toml");
 assertReadable("Readme.md");
-assertContains("workers.js", "export default");
+assertContains("workers.js", "src/index.js");
 assertContains("wrangler.toml", "main = \"workers.js\"");
 console.log("check passed");
