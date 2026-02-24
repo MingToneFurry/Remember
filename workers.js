@@ -208,7 +208,33 @@ async function handleProxy(request, env, url) {
 
   const r = await fetch(upstream, { cf: { cacheTtl: 0, cacheEverything: false } });
   const text = await r.text();
-  return new Response(text, { status: r.status, headers: securityHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }) });
+
+  // Merge existing security headers with CORS headers and Vary: Origin
+  const baseHeaders = securityHeaders({
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  const headers = new Headers(baseHeaders);
+
+  const origin = request.headers.get("Origin");
+  // Only allow configured domain to access this proxy
+  if (origin && origin === DOMAIN) {
+    headers.set("Access-Control-Allow-Origin", origin);
+    // If the proxy relies on cookies or auth, this allows them to be sent
+    headers.set("Access-Control-Allow-Credentials", "true");
+  }
+
+  // Ensure Vary includes Origin (without dropping any existing Vary values)
+  const existingVary = headers.get("Vary");
+  if (existingVary) {
+    if (!existingVary.split(",").map(v => v.trim().toLowerCase()).includes("origin")) {
+      headers.set("Vary", existingVary + ", Origin");
+    }
+  } else {
+    headers.set("Vary", "Origin");
+  }
+
+  return new Response(text, { status: r.status, headers });
 }
 
 async function handleUploadInit(request, env) {
