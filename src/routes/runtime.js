@@ -1,4 +1,6 @@
 import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
+import { analyzeWithGrok } from "../services/grokAnalyzer.js";
+import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData, fetchTopVideoInfosByPlayCount } from "../services/memorialData.js";
 import { buildMemorialPage } from "../templates/memorialTemplate.js";
 
 const DOMAIN = "https://rem.furry.ist";
@@ -341,26 +343,70 @@ function buildPage(uid, snapshot) {
 
 async function processGenerateJob(env, jobId) {
   const jobKey = `job:${jobId}`;
-  const job = await env.REMEMBER_KV.get(jobKey, "json");
-  if (!job || job.status !== "pending") return;
-  job.status = "running";
-  await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 3600 });
+  const current = await env.REMEMBER_KV.get(jobKey, "json");
+  if (!current) return;
+  if (!["queued", "pending", "running"].includes(String(current.status || ""))) return;
+  const uid = normalizeUid(current.uid);
+  if (!uid) {
+    await env.REMEMBER_KV.put(jobKey, JSON.stringify({ ...current, status: "failed", stage: "failed", error: "uid 不合法", updatedAt: Date.now() }), {
+      expirationTtl: 24 * 3600,
+    });
+    return;
+  }
+
+  const patchJob = async (patch) => {
+    const latest = (await env.REMEMBER_KV.get(jobKey, "json")) || {};
+    const merged = { ...latest, ...patch, updatedAt: Date.now() };
+    await env.REMEMBER_KV.put(jobKey, JSON.stringify(merged), { expirationTtl: 24 * 3600 });
+    return merged;
+  };
+
+  await patchJob({ status: "running", stage: "fetching", progress: 10 });
   try {
-    const uploads = (await env.REMEMBER_KV.get(`uploads:index:${job.uid}`, "json")) || [];
-    const snapshot = { uid: job.uid, uploads, createdAt: Date.now() };
-    const html = buildPage(job.uid, snapshot);
-    await env.REMEMBER_DATA.put(`pages/${job.uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } });
-    await env.REMEMBER_DATA.put(`snapshots/${job.uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
-    const item = { uid: job.uid, createdAt: Date.now(), url: `/u/${job.uid}` };
-    await env.REMEMBER_KV.put(`meta:uid:${job.uid}`, JSON.stringify(item));
+    const uploads = (await env.REMEMBER_KV.get(`uploads:index:${uid}`, "json")) || [];
+    const allVid = await fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 });
+    const comments = await fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 });
+    const danmu = await fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 });
+    const liveDanmu = await fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 });
+    const topVideoInfos = await fetchTopVideoInfosByPlayCount(upstreamClient, allVid.videos || [], { topN: 10, concurrency: 3 });
+    const regDateEstimate = estimateRegDateByUid(uid);
+    const dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
+
+    await patchJob({ stage: "analyzing", progress: 60 });
+    const snapshotBase = {
+      uid,
+      uploads,
+      createdAt: Date.now(),
+      generatedAt: Date.now(),
+      dataNotice,
+      sourceQuality: "third-party-unstable",
+      allVid,
+      topVideoInfos,
+      comments,
+      danmu,
+      liveDanmu,
+      regDateEstimate,
+    };
+    const modelOutput = await analyzeWithGrok(env, upstreamClient, snapshotBase);
+    const snapshot = { ...snapshotBase, modelOutput };
+
+    await patchJob({ stage: "rendering", progress: 85 });
+    const html = buildPage(uid, snapshot);
+    await env.REMEMBER_DATA.put(`pages/${uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } });
+    await env.REMEMBER_DATA.put(`snapshots/${uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
+    const item = { uid, createdAt: Date.now(), url: `/u/${uid}` };
+    await env.REMEMBER_KV.put(`meta:uid:${uid}`, JSON.stringify(item));
     await saveRecent(env, item);
-    job.status = "succeeded";
-    job.url = item.url;
-    await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 86400 });
+
+    await patchJob({ stage: "syncing", progress: 95 });
+    await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url });
   } catch (err) {
-    job.status = "failed";
-    job.error = String(err?.message || err);
-    await env.REMEMBER_KV.put(jobKey, JSON.stringify(job), { expirationTtl: 86400 });
+    await patchJob({
+      status: "failed",
+      stage: "failed",
+      error: String(err?.message || err),
+      warnings: [`任务失败: ${String(err?.message || err)}`],
+    });
   }
 }
 
@@ -772,11 +818,43 @@ async function handleScheduled(event, env) {
   } while (kvCursor);
 }
 
+function parseQueueMessageBody(body) {
+  if (typeof body === "string") return JSON.parse(body);
+  if (body && typeof body.text === "function") return body.text().then((t) => JSON.parse(t));
+  if (body instanceof Uint8Array) return JSON.parse(new TextDecoder().decode(body));
+  return JSON.parse(String(body || "{}"));
+}
+
+async function handleQueue(batch, env) {
+  for (const message of batch.messages || []) {
+    try {
+      const payload = await parseQueueMessageBody(message.body);
+      const jobId = String(payload?.jobId || "").trim();
+      const uid = normalizeUid(payload?.uid);
+      if (!jobId || !uid) {
+        if (typeof message.ack === "function") message.ack();
+        continue;
+      }
+      await processGenerateJob(env, jobId);
+      if (typeof message.ack === "function") message.ack();
+    } catch (err) {
+      if (typeof message.retry === "function") {
+        message.retry();
+      } else if (typeof message.ack === "function") {
+        message.ack();
+      }
+    }
+  }
+}
+
 export default {
   fetch(request, env, ctx) {
     return handleFetch(request, env, ctx);
   },
   scheduled(event, env, ctx) {
     ctx.waitUntil(handleScheduled(event, env));
+  },
+  queue(batch, env, ctx) {
+    ctx.waitUntil(handleQueue(batch, env));
   },
 };
