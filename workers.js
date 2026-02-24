@@ -3,7 +3,10 @@ const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;
 const PART_SIZE_HINT = 8 * 1024 * 1024;
 const MAX_PARTS = 10000;
 const MAX_RECENT = 50;
+const MAX_ADMIN_REQUESTS_PAGE_SIZE = 200;
+const MAX_SITEMAP_URLS = 50000;
 const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
+const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
 
 function ensureSecret(value, name) {
   if (!value || typeof value !== "string" || value.length < 16) {
@@ -53,7 +56,7 @@ function htmlResponse(html, status = 200, headers = {}) {
   h.set("content-type", "text/html; charset=utf-8");
   h.set(
     "content-security-policy",
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self';",
+    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self';",
   );
   return new Response(html, { status, headers: h });
 }
@@ -82,6 +85,38 @@ async function sha256Text(text) {
   return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function parseBoundedInt(input, min, max, fallback) {
+  const raw = String(input ?? "").trim();
+  if (!/^\d+$/.test(raw)) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+function timingSafeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i += 1) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+function decodeBase64UrlToBytes(input) {
+  const normalized = String(input || "").replace(/-/g, "+").replace(/_/g, "/");
+  const pad = normalized.length % 4;
+  const padded = normalized + (pad ? "=".repeat(4 - pad) : "");
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function decodeBase64UrlToString(input) {
+  return new TextDecoder().decode(decodeBase64UrlToBytes(input));
+}
+
 async function issueSignedToken(env, payload, ttlSeconds) {
   ensureSecret(env.TOKEN_SIGNING_SECRET, "TOKEN_SIGNING_SECRET");
   const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
@@ -96,13 +131,10 @@ async function verifySignedToken(env, token) {
   if (!token || !token.includes(".")) return null;
   const [body, sig] = token.split(".", 2);
   const expected = await sha256Text(`${body}.${env.TOKEN_SIGNING_SECRET}`);
-  if (expected !== sig) return null;
+  if (!timingSafeEqual(expected, sig)) return null;
 
   try {
-    const normalized = body.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = normalized.length % 4;
-    const padded = normalized + (pad ? "=".repeat(4 - pad) : "");
-    const payload = JSON.parse(atob(padded));
+    const payload = JSON.parse(decodeBase64UrlToString(body));
     if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
   } catch {
@@ -139,6 +171,116 @@ function requireAdminAccess(request) {
   const email = request.headers.get("cf-access-authenticated-user-email");
   const jwt = request.headers.get("cf-access-jwt-assertion");
   if (!email || !jwt) throw new HttpError(403, "需要 Cloudflare Access");
+}
+
+const accessJwksCache = new Map();
+const accessKeyCache = new Map();
+
+function parseAccessAudienceConfig(value) {
+  return String(value || "")
+    .split(",")
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function accessAudMatchesClaim(claim, accepted) {
+  if (!claim) return false;
+  if (Array.isArray(claim)) return claim.some((v) => accepted.includes(String(v)));
+  return accepted.includes(String(claim));
+}
+
+function normalizeAccessIssuer(issuer) {
+  try {
+    const parsed = new URL(String(issuer || ""));
+    const host = parsed.hostname.toLowerCase();
+    if (parsed.protocol !== "https:") return null;
+    if (host === "cloudflareaccess.com" || host.endsWith(".cloudflareaccess.com")) {
+      return parsed.origin;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function getAccessJwks(issuer) {
+  const now = Date.now();
+  const cached = accessJwksCache.get(issuer);
+  if (cached && cached.expiresAt > now) return cached.keys;
+  const certsUrl = new URL("/cdn-cgi/access/certs", `${issuer}/`);
+  const resp = await fetch(certsUrl.toString(), { headers: { accept: "application/json" } });
+  if (!resp.ok) throw new HttpError(403, "Cloudflare Access validation failed");
+  const data = await resp.json();
+  const keys = Array.isArray(data?.keys) ? data.keys : [];
+  if (keys.length === 0) throw new HttpError(403, "Cloudflare Access validation failed");
+  accessJwksCache.set(issuer, { keys, expiresAt: now + ACCESS_JWKS_CACHE_TTL_MS });
+  return keys;
+}
+
+async function importAccessPublicKey(jwk) {
+  const cacheKey = JSON.stringify({ kid: jwk.kid, n: jwk.n, e: jwk.e, kty: jwk.kty });
+  const cached = accessKeyCache.get(cacheKey);
+  if (cached) return cached;
+  if (jwk.kty !== "RSA") throw new HttpError(403, "Cloudflare Access validation failed");
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    { ...jwk, key_ops: ["verify"], ext: true },
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  accessKeyCache.set(cacheKey, key);
+  return key;
+}
+
+async function verifyAccessJwt(env, jwt) {
+  const acceptedAudiences = parseAccessAudienceConfig(env.ACCESS_AUD);
+  if (acceptedAudiences.length === 0) {
+    throw new HttpError(500, "ACCESS_AUD not configured");
+  }
+  const parts = String(jwt || "").split(".");
+  if (parts.length !== 3) throw new HttpError(403, "Cloudflare Access required");
+  const [headerPart, payloadPart, signaturePart] = parts;
+  let header;
+  let payload;
+  try {
+    header = JSON.parse(decodeBase64UrlToString(headerPart));
+    payload = JSON.parse(decodeBase64UrlToString(payloadPart));
+  } catch {
+    throw new HttpError(403, "Cloudflare Access required");
+  }
+  if (header?.alg !== "RS256") throw new HttpError(403, "Cloudflare Access required");
+  const issuer = normalizeAccessIssuer(payload?.iss);
+  if (!issuer) throw new HttpError(403, "Cloudflare Access required");
+  if (!accessAudMatchesClaim(payload?.aud, acceptedAudiences)) throw new HttpError(403, "Cloudflare Access required");
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isFinite(payload?.exp) || payload.exp <= now) throw new HttpError(403, "Cloudflare Access required");
+  if (Number.isFinite(payload?.nbf) && payload.nbf > now + 60) throw new HttpError(403, "Cloudflare Access required");
+  const jwks = await getAccessJwks(issuer);
+  const jwk = jwks.find((k) => k.kid === header.kid) || jwks[0];
+  const key = await importAccessPublicKey(jwk);
+  const verified = await crypto.subtle.verify(
+    { name: "RSASSA-PKCS1-v1_5" },
+    key,
+    decodeBase64UrlToBytes(signaturePart),
+    new TextEncoder().encode(`${headerPart}.${payloadPart}`),
+  );
+  if (!verified) throw new HttpError(403, "Cloudflare Access required");
+  return payload;
+}
+
+async function requireAdminAccessVerified(request, env) {
+  const jwt = request.headers.get("cf-access-jwt-assertion");
+  if (!jwt) throw new HttpError(403, "Cloudflare Access required");
+  const payload = await verifyAccessJwt(env, jwt);
+  const email = request.headers.get("cf-access-authenticated-user-email");
+  if (email && payload?.email && email !== payload.email) {
+    throw new HttpError(403, "Cloudflare Access identity mismatch");
+  }
+}
+
+async function requireAdminAccessStrict(request, env) {
+  await requireAdminAccessVerified(request, env);
 }
 
 function sanitizeFileName(input) {
@@ -179,7 +321,7 @@ function homepageHtml(siteKey) {
 
 async function getRecent(env, limit = MAX_RECENT) {
   const items = (await env.REMEMBER_KV.get("recent:list", "json")) || [];
-  const max = Math.max(1, Math.min(MAX_RECENT, Number(limit) || MAX_RECENT));
+  const max = parseBoundedInt(limit, 1, MAX_RECENT, MAX_RECENT);
   return Array.isArray(items) ? items.slice(0, max) : [];
 }
 
@@ -233,10 +375,10 @@ async function handleProxy(request, env, url) {
   let upstream;
   if (source === "allVid") {
     if (!uid) throw new HttpError(400, "allVid 需要 uid");
-    const pn = Math.max(1, Math.min(200, Number(url.searchParams.get("pn") || "1")));
-    upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${uid}&ps=50&pn=${pn}`;
+    const pn = parseBoundedInt(url.searchParams.get("pn"), 1, 200, 1);
+    upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=50&pn=${pn}`;
   } else if (source === "comment") {
-    const page = Math.max(1, Math.min(1000, Number(url.searchParams.get("page") || "1")));
+    const page = parseBoundedInt(url.searchParams.get("page"), 1, 1000, 1);
     if (!bvid || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new HttpError(400, "comment 需要合法 bvid");
     upstream = `https://uapis.cn/api/v1/social/bilibili/replies?bvid=${encodeURIComponent(bvid)}&pn=${page}`;
   } else {
@@ -310,6 +452,7 @@ async function handleUploadComplete(request, env) {
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
   await multipart.complete(normalizedParts);
   const idxKey = `uploads:index:${session.uid}`;
+  // NOTE: KV does not provide atomic read-modify-write. This list is best-effort.
   const list = (await env.REMEMBER_KV.get(idxKey, "json")) || [];
   list.push({ uploadId, key: session.key, fileName: session.fileName, mime: session.mime, size: session.size, createdAt: Date.now() });
   await env.REMEMBER_KV.put(idxKey, JSON.stringify(list.slice(-200)));
@@ -348,7 +491,8 @@ async function handleRemovalCreate(request, env) {
   await verifyTurnstile(request, env, body.turnstileToken);
   const id = randomId("rr");
   const code = randomId("code");
-  await env.REMEMBER_KV.put(`removal:req:${id}`, JSON.stringify({ id, uid, reason: String(body.reason || "").slice(0, 1000), status: "pending", code, createdAt: Date.now() }));
+  const reason = String(body.reason || "").slice(0, 1000).trim();
+  await env.REMEMBER_KV.put(`removal:req:${id}`, JSON.stringify({ id, uid, reason, status: "pending", code, createdAt: Date.now() }));
   return jsonResponse({ ok: true, id, queryCode: code }, 200, { "cache-control": "no-store" });
 }
 
@@ -361,24 +505,79 @@ async function handleRemovalGet(env, url) {
   return jsonResponse({ id: req.id, uid: req.uid, status: req.status, createdAt: req.createdAt }, 200, { "cache-control": "no-store" });
 }
 
+async function deleteR2ByPrefix(env, prefix) {
+  let cursor;
+  do {
+    const list = await env.REMEMBER_DATA.list({ prefix, cursor });
+    await Promise.all(list.objects.map((obj) => env.REMEMBER_DATA.delete(obj.key)));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+}
+
+async function deleteRawByUid(env, uid) {
+  const uidPrefix = `/${uid}/`;
+  let cursor;
+  do {
+    const list = await env.REMEMBER_DATA.list({ prefix: "raw/", cursor });
+    const matches = list.objects.filter((obj) => obj.key.includes(uidPrefix)).map((obj) => obj.key);
+    await Promise.all(matches.map((key) => env.REMEMBER_DATA.delete(key)));
+    cursor = list.truncated ? list.cursor : undefined;
+  } while (cursor);
+}
+
+async function deleteUploadSessionsByUid(env, uid) {
+  let cursor;
+  do {
+    const list = await env.REMEMBER_KV.list({ prefix: "upload:", cursor });
+    const values = await Promise.all(list.keys.map((k) => env.REMEMBER_KV.get(k.name, "json")));
+    const doomed = [];
+    for (let i = 0; i < list.keys.length; i += 1) {
+      if (values[i]?.uid === uid) doomed.push(list.keys[i].name);
+    }
+    await Promise.all(doomed.map((key) => env.REMEMBER_KV.delete(key)));
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
+}
+
+async function removeUidFromRecent(env, uid) {
+  const current = await getRecent(env, MAX_RECENT);
+  const filtered = current.filter((item) => item.uid !== uid);
+  if (filtered.length !== current.length) {
+    await env.REMEMBER_KV.put("recent:list", JSON.stringify(filtered));
+  }
+}
+
+async function cleanupRemovedUidData(env, uid) {
+  await Promise.all([
+    deleteR2ByPrefix(env, `snapshots/${uid}/`),
+    deleteRawByUid(env, uid),
+    deleteUploadSessionsByUid(env, uid),
+  ]);
+}
+
 async function handleAdmin(request, env, url, ctx) {
-  requireAdminAccess(request);
+  await requireAdminAccessStrict(request, env);
   if (request.method === "GET" && url.pathname === "/admin") {
     return htmlResponse("<h1>Admin</h1><p>可通过 /api/admin/* 使用管理接口。</p>", 200, { "cache-control": "no-store" });
   }
   if (request.method === "GET" && url.pathname === "/api/admin/requests") {
-    const status = String(url.searchParams.get("status") || "pending");
+    const statusParam = String(url.searchParams.get("status") || "pending").trim();
+    const status = statusParam === "all" ? "" : statusParam;
+    if (status && !["pending", "approved", "rejected"].includes(status)) {
+      throw new HttpError(400, "invalid status");
+    }
+    const limit = parseBoundedInt(url.searchParams.get("limit"), 1, MAX_ADMIN_REQUESTS_PAGE_SIZE, 50);
+    const cursor = String(url.searchParams.get("cursor") || "").trim() || undefined;
+    const list = await env.REMEMBER_KV.list({ prefix: "removal:req:", cursor, limit });
+    const values = await Promise.all(list.keys.map((k) => env.REMEMBER_KV.get(k.name, "json")));
     const out = [];
-    let cursor;
-    do {
-      const list = await env.REMEMBER_KV.list({ prefix: "removal:req:", cursor });
-      for (const k of list.keys) {
-        const v = await env.REMEMBER_KV.get(k.name, "json");
-        if (v && (!status || v.status === status)) out.push({ id: v.id, uid: v.uid, status: v.status, createdAt: v.createdAt });
+    for (const v of values) {
+      if (v && (!status || v.status === status)) {
+        out.push({ id: v.id, uid: v.uid, status: v.status, createdAt: v.createdAt });
       }
-      cursor = list.list_complete ? undefined : list.cursor;
-    } while (cursor);
-    return jsonResponse({ items: out }, 200, { "cache-control": "no-store" });
+    }
+    const nextCursor = list.list_complete ? null : list.cursor;
+    return jsonResponse({ items: out, cursor: nextCursor }, 200, { "cache-control": "no-store" });
   }
   const reqMatch = url.pathname.match(/^\/api\/admin\/requests\/([^/]+)\/(approve|reject)$/);
   if (request.method === "POST" && reqMatch) {
@@ -390,8 +589,15 @@ async function handleAdmin(request, env, url, ctx) {
     reqObj.status = action === "approve" ? "approved" : "rejected";
     await env.REMEMBER_KV.put(key, JSON.stringify(reqObj));
     if (action === "approve") {
-      await env.REMEMBER_DATA.delete(`pages/${reqObj.uid}.html`);
-      await env.REMEMBER_KV.delete(`meta:uid:${reqObj.uid}`);
+      const uid = normalizeUid(reqObj.uid);
+      if (!uid) throw new HttpError(500, "request data invalid");
+      await Promise.all([
+        env.REMEMBER_DATA.delete(`pages/${uid}.html`),
+        env.REMEMBER_KV.delete(`meta:uid:${uid}`),
+        env.REMEMBER_KV.delete(`uploads:index:${uid}`),
+        removeUidFromRecent(env, uid),
+      ]);
+      ctx.waitUntil(cleanupRemovedUidData(env, uid));
     }
     return jsonResponse({ ok: true, status: reqObj.status }, 200, { "cache-control": "no-store" });
   }
@@ -417,17 +623,19 @@ async function handleAdmin(request, env, url, ctx) {
 
 async function sitemapXml(env) {
   const prefix = "meta:uid:";
-  const urls = [];
+  const urls = [`<url><loc>${DOMAIN}/</loc></url>`];
   let cursor;
   do {
-    const list = await env.REMEMBER_KV.list({ prefix, cursor });
+    const list = await env.REMEMBER_KV.list({ prefix, cursor, limit: 1000 });
     for (const item of list.keys) {
+      if (urls.length >= MAX_SITEMAP_URLS) break;
       const uid = item.name.slice(prefix.length);
       if (normalizeUid(uid)) urls.push(`<url><loc>${DOMAIN}/u/${uid}</loc></url>`);
     }
+    if (urls.length >= MAX_SITEMAP_URLS) break;
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
-  return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${DOMAIN}/</loc></url>${urls.join("")}</urlset>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join("")}</urlset>`;
 }
 
 async function handleFetch(request, env, ctx) {
@@ -451,7 +659,7 @@ async function handleFetch(request, env, ctx) {
     }
 
     if (request.method === "GET" && path === "/api/recent") {
-      const limit = Math.max(1, Math.min(MAX_RECENT, Number(url.searchParams.get("limit") || MAX_RECENT)));
+      const limit = parseBoundedInt(url.searchParams.get("limit"), 1, MAX_RECENT, MAX_RECENT);
       return jsonResponse({ items: await getRecent(env, limit) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
     }
     if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url), cors);

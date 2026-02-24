@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 TURNSTILE_SITE_KEY = ""
+ACCESS_AUD = ""
 
 [[r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -19,6 +20,7 @@ routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
 
 [env.production.vars]
 TURNSTILE_SITE_KEY = ""
+ACCESS_AUD = ""
 
 [[env.production.r2_buckets]]
 binding = "REMEMBER_DATA"

@@ -14,7 +14,7 @@
 ### 1. 页面路由
 - `GET /`：首页（UID 输入、Turnstile、最近列表）
 - `GET /u/:uid`：用户专属纪念页
-- `GET /admin`：管理页占位（需 Cloudflare Access 头）
+- `GET /admin`：管理页占位（需 Cloudflare Access）
 - `GET /sitemap.xml`
 - `GET /robots.txt`
 
@@ -30,7 +30,7 @@
 - `GET /api/removal-requests/:id?code=`：查询移除申请状态
 
 ### 3. 管理 API（Cloudflare Access）
-- `GET /api/admin/requests?status=`
+- `GET /api/admin/requests?status=&limit=&cursor=`
 - `POST /api/admin/requests/:id/approve`
 - `POST /api/admin/requests/:id/reject`
 - `POST /api/admin/pages/:uid/unpublish`
@@ -68,7 +68,7 @@
    - CSP + 基础安全响应头。
 
 5. **权限隔离**
-   - admin 路由必须由 Cloudflare Access 在边缘强制保护（Worker 内仅做兜底检查，不应单独依赖请求头存在性）。
+   - admin 路由必须由 Cloudflare Access 在边缘强制保护，同时 Worker 会对 `cf-access-jwt-assertion` 做签名和 `aud` 校验。
 
 6. **防刷限制**
    - 按 IP 的每日限流：代理/生成/上传初始化。
@@ -95,10 +95,10 @@ name = "remember-pages"
 main = "workers.js"
 compatibility_date = "2026-01-15"
 workers_dev = true
-routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
 
 [vars]
 TURNSTILE_SITE_KEY = "<site-key>"
+ACCESS_AUD = "<cloudflare-access-aud>"
 
 [[r2_buckets]]
 binding = "REMEMBER_DATA"
@@ -107,16 +107,32 @@ bucket_name = "remember-data"
 [[kv_namespaces]]
 binding = "REMEMBER_KV"
 id = "<your-kv-id>"
+
+[env.production]
+routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
+
+[env.production.vars]
+TURNSTILE_SITE_KEY = "<site-key>"
+ACCESS_AUD = "<cloudflare-access-aud>"
+
+[[env.production.r2_buckets]]
+binding = "REMEMBER_DATA"
+bucket_name = "remember-data"
+
+[[env.production.kv_namespaces]]
+binding = "REMEMBER_KV"
+id = "<your-kv-id>"
 ```
 
 ## 3) 注入密钥
 
 ```bash
-wrangler secret put TURNSTILE_SECRET
-wrangler secret put TOKEN_SIGNING_SECRET
+wrangler secret put TURNSTILE_SECRET --env production
+wrangler secret put TOKEN_SIGNING_SECRET --env production
 ```
 
 > `TOKEN_SIGNING_SECRET` 用于上传令牌签名，必须是高强度随机字符串。
+> `ACCESS_AUD` 来自 Cloudflare Access Application 的 AUD（JWT aud claim），可配置多个值并用逗号分隔。
 
 ## 4) 本地联调
 
@@ -147,7 +163,7 @@ wrangler deploy --env production
 ### 已覆盖高风险点
 - SSRF：已通过 source 与固定域名白名单封死。
 - XSS：模板输出 escape + CSP。
-- 越权：admin 接口依赖 Access 头。
+- 越权：admin 接口依赖 Access + Worker 内 JWT 验签。
 - 重放：上传 token 有签名+过期。
 - 缓存污染：写接口 `no-store`。
 
