@@ -89,9 +89,14 @@ async function verifySignedToken(env, token) {
   const [body, sig] = token.split(".", 2);
   const expected = await sha256Text(`${body}.${env.TOKEN_SIGNING_SECRET}`);
   if (expected !== sig) return null;
-  const payload = JSON.parse(atob(body.replace(/-/g, "+").replace(/_/g, "/")));
-  if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
-  return payload;
+
+  try {
+    const payload = JSON.parse(atob(body.replace(/-/g, "+").replace(/_/g, "/")));
+    if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
 
 async function verifyTurnstile(request, env, token) {
@@ -404,17 +409,29 @@ async function handleFetch(request, env, ctx) {
 async function handleScheduled(event, env) {
   const now = Date.now();
   const sevenDaysAgo = now - 7 * 24 * 3600 * 1000;
-  const list = await env.REMEMBER_DATA.list({ prefix: "raw/" });
-  for (const obj of list.objects) {
-    if (obj.uploaded.getTime() < sevenDaysAgo) {
-      await env.REMEMBER_DATA.delete(obj.key);
+
+  let r2Cursor = undefined;
+  do {
+    const list = await env.REMEMBER_DATA.list({ prefix: "raw/", cursor: r2Cursor });
+    for (const obj of list.objects) {
+      if (obj.uploaded.getTime() < sevenDaysAgo) {
+        await env.REMEMBER_DATA.delete(obj.key);
+      }
     }
-  }
-  const kvUploads = await env.REMEMBER_KV.list({ prefix: "upload:" });
-  for (const key of kvUploads.keys) {
-    const v = await env.REMEMBER_KV.get(key.name, "json");
-    if (v && v.createdAt && now - v.createdAt > 24 * 3600 * 1000) await env.REMEMBER_KV.delete(key.name);
-  }
+    r2Cursor = list.truncated ? list.cursor : undefined;
+  } while (r2Cursor);
+
+  let kvCursor = undefined;
+  do {
+    const kvUploads = await env.REMEMBER_KV.list({ prefix: "upload:", cursor: kvCursor });
+    for (const key of kvUploads.keys) {
+      const v = await env.REMEMBER_KV.get(key.name, "json");
+      if (v && v.createdAt && now - v.createdAt > 24 * 3600 * 1000) {
+        await env.REMEMBER_KV.delete(key.name);
+      }
+    }
+    kvCursor = kvUploads.list_complete ? undefined : kvUploads.cursor;
+  } while (kvCursor);
 }
 
 export default {
