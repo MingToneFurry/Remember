@@ -16,7 +16,13 @@ const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
 const JOB_ID_REGEX = /^job_[a-f0-9]{32}$/;
 const PUBLIC_ERROR_DETAIL_LIMIT = 5;
 const PUBLIC_ERROR_TEXT_LIMIT = 160;
+const HOT_CACHE_TTL_MS = 15 * 1000;
+const SITEMAP_CACHE_KEY = "cache:sitemap:xml";
 const upstreamClient = createDefaultUpstreamClient(fetch);
+const hotCache = {
+  recent: { expiresAt: 0, items: [] },
+  sitemap: { expiresAt: 0, xml: "" },
+};
 
 function ensureSecret(value, name) {
   if (!value || typeof value !== "string" || value.length < 16) {
@@ -149,6 +155,32 @@ function randomId(prefix = "id") {
 function generateCspNonce() {
   const arr = crypto.getRandomValues(new Uint8Array(18));
   return btoa(String.fromCharCode(...arr)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function getHotRecentCache() {
+  if (hotCache.recent.expiresAt > Date.now() && Array.isArray(hotCache.recent.items)) {
+    return hotCache.recent.items;
+  }
+  return null;
+}
+
+function setHotRecentCache(items) {
+  hotCache.recent = {
+    expiresAt: Date.now() + HOT_CACHE_TTL_MS,
+    items: Array.isArray(items) ? items.slice(0, MAX_RECENT) : [],
+  };
+}
+
+function getHotSitemapCache() {
+  if (hotCache.sitemap.expiresAt > Date.now() && hotCache.sitemap.xml) return hotCache.sitemap.xml;
+  return null;
+}
+
+function setHotSitemapCache(xml) {
+  hotCache.sitemap = {
+    expiresAt: Date.now() + HOT_CACHE_TTL_MS,
+    xml: String(xml || ""),
+  };
 }
 
 async function sha256Text(text) {
@@ -556,16 +588,23 @@ function homepageHtml(siteKey, scriptNonce = "") {
   </script></body></html>`;
 }
 
-async function getRecent(env, limit = MAX_RECENT) {
-  const items = (await env.REMEMBER_KV.get("recent:list", "json")) || [];
+async function getRecent(env, limit = MAX_RECENT, options = {}) {
   const max = parseBoundedInt(limit, 1, MAX_RECENT, MAX_RECENT);
-  return Array.isArray(items) ? items.slice(0, max) : [];
+  if (!options.skipCache) {
+    const cached = getHotRecentCache();
+    if (cached) return cached.slice(0, max);
+  }
+  const items = (await env.REMEMBER_KV.get("recent:list", "json")) || [];
+  const normalized = Array.isArray(items) ? items.slice(0, MAX_RECENT) : [];
+  setHotRecentCache(normalized);
+  return normalized.slice(0, max);
 }
 
 async function saveRecent(env, item) {
-  const current = await getRecent(env);
+  const current = await getRecent(env, MAX_RECENT);
   const merged = [item, ...current.filter((v) => v.uid !== item.uid)].slice(0, MAX_RECENT);
   await env.REMEMBER_KV.put("recent:list", JSON.stringify(merged));
+  setHotRecentCache(merged);
 }
 
 function buildPage(uid, snapshot) {
@@ -594,21 +633,25 @@ async function processGenerateJob(env, jobId) {
 
   await patchJob({ status: "running", stage: "fetching", progress: 10 });
   try {
-    const uploads = (await env.REMEMBER_KV.get(`uploads:index:${uid}`, "json")) || [];
-    const allVid = await fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 });
-    const comments = await fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 });
-    const danmu = await fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 });
-    const liveDanmu = await fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 });
+    const [uploadsRaw, allVid, comments, danmu, liveDanmu] = await Promise.all([
+      env.REMEMBER_KV.get(`uploads:index:${uid}`, "json"),
+      fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 }),
+      fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 }),
+      fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 }),
+      fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 }),
+    ]);
+    const uploads = Array.isArray(uploadsRaw) ? uploadsRaw : [];
     const topVideoInfos = await fetchTopVideoInfosByPlayCount(upstreamClient, allVid.videos || [], { topN: 10, concurrency: 3 });
     const regDateEstimate = estimateRegDateByUid(uid);
     const dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
+    const generatedAt = Date.now();
 
     await patchJob({ stage: "analyzing", progress: 60 });
     const snapshotBase = {
       uid,
       uploads,
-      createdAt: Date.now(),
-      generatedAt: Date.now(),
+      createdAt: generatedAt,
+      generatedAt,
       dataNotice,
       sourceQuality: "third-party-unstable",
       allVid,
@@ -627,13 +670,15 @@ async function processGenerateJob(env, jobId) {
 
     await patchJob({ stage: "rendering", progress: 85, warnings });
     const html = buildPage(uid, snapshot);
-    await env.REMEMBER_DATA.put(`pages/${uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } });
-    await env.REMEMBER_DATA.put(`snapshots/${uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } });
-    const item = { uid, createdAt: Date.now(), url: `/u/${uid}` };
-    await env.REMEMBER_KV.put(`meta:uid:${uid}`, JSON.stringify(item));
+    const item = { uid, createdAt: generatedAt, url: `/u/${uid}` };
+    await Promise.all([
+      env.REMEMBER_DATA.put(`pages/${uid}.html`, html, { httpMetadata: { contentType: "text/html; charset=utf-8" } }),
+      env.REMEMBER_DATA.put(`snapshots/${uid}/${jobId}.json`, JSON.stringify(snapshot), { httpMetadata: { contentType: "application/json" } }),
+      env.REMEMBER_KV.put(`meta:uid:${uid}`, JSON.stringify(item)),
+    ]);
     await saveRecent(env, item);
     const recentList = await getRecent(env, MAX_RECENT);
-    const sitemap = await sitemapXml(env);
+    const sitemap = (await appendUidToSitemapCache(env, uid)) || (await sitemapXml(env, { forceRebuild: true }));
 
     await patchJob({ stage: "syncing", progress: 95, warnings });
     const gitSync = await syncGeneratedPageToGitHub(env, { uid, html, snapshot, item, recentList, sitemapXml: sitemap });
@@ -926,6 +971,7 @@ async function removeUidFromRecent(env, uid) {
   const filtered = current.filter((item) => item.uid !== uid);
   if (filtered.length !== current.length) {
     await env.REMEMBER_KV.put("recent:list", JSON.stringify(filtered));
+    setHotRecentCache(filtered);
   }
 }
 
@@ -979,6 +1025,7 @@ async function handleAdmin(request, env, url, ctx) {
         env.REMEMBER_KV.delete(`uploads:index:${uid}`),
         removeUidFromRecent(env, uid),
       ]);
+      await sitemapXml(env, { forceRebuild: true });
       ctx.waitUntil(cleanupRemovedUidData(env, uid));
     }
     return jsonResponse({ ok: true, status: reqObj.status }, 200, { "cache-control": "no-store" });
@@ -989,6 +1036,8 @@ async function handleAdmin(request, env, url, ctx) {
     if (!uid) throw new HttpError(400, "uid 不合法");
     await env.REMEMBER_DATA.delete(`pages/${uid}.html`);
     await env.REMEMBER_KV.delete(`meta:uid:${uid}`);
+    await removeUidFromRecent(env, uid);
+    await sitemapXml(env, { forceRebuild: true });
     return jsonResponse({ ok: true }, 200, { "cache-control": "no-store" });
   }
   const regenMatch = url.pathname.match(/^\/api\/admin\/pages\/([^/]+)\/regenerate$/);
@@ -1003,7 +1052,40 @@ async function handleAdmin(request, env, url, ctx) {
   throw new HttpError(404, "admin route not found");
 }
 
-async function sitemapXml(env) {
+async function appendUidToSitemapCache(env, uid) {
+  const normalizedUid = normalizeUid(uid);
+  if (!normalizedUid) return null;
+  let xml = getHotSitemapCache();
+  if (!xml) {
+    xml = await env.REMEMBER_KV.get(SITEMAP_CACHE_KEY);
+  }
+  if (!xml || typeof xml !== "string") return null;
+  const targetLoc = `${DOMAIN}/u/${normalizedUid}`;
+  const needle = `<loc>${targetLoc}</loc>`;
+  if (xml.includes(needle)) return xml;
+  const endTag = "</urlset>";
+  const endIndex = xml.lastIndexOf(endTag);
+  if (endIndex <= 0) return null;
+  const appended = `${xml.slice(0, endIndex)}<url><loc>${targetLoc}</loc></url>${xml.slice(endIndex)}`;
+  const urlCount = (appended.match(/<url>/g) || []).length;
+  if (urlCount > MAX_SITEMAP_URLS) return null;
+  setHotSitemapCache(appended);
+  await env.REMEMBER_KV.put(SITEMAP_CACHE_KEY, appended, { expirationTtl: 12 * 3600 });
+  return appended;
+}
+
+async function sitemapXml(env, options = {}) {
+  const forceRebuild = Boolean(options.forceRebuild);
+  if (!forceRebuild) {
+    const hot = getHotSitemapCache();
+    if (hot) return hot;
+    const persisted = await env.REMEMBER_KV.get(SITEMAP_CACHE_KEY);
+    if (persisted) {
+      setHotSitemapCache(persisted);
+      return persisted;
+    }
+  }
+
   const prefix = "meta:uid:";
   const urls = [`<url><loc>${DOMAIN}/</loc></url>`];
   let cursor;
@@ -1017,7 +1099,10 @@ async function sitemapXml(env) {
     if (urls.length >= MAX_SITEMAP_URLS) break;
     cursor = list.list_complete ? undefined : list.cursor;
   } while (cursor);
-  return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join("")}</urlset>`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${urls.join("")}</urlset>`;
+  setHotSitemapCache(xml);
+  await env.REMEMBER_KV.put(SITEMAP_CACHE_KEY, xml, { expirationTtl: 12 * 3600 });
+  return xml;
 }
 
 async function handleFetch(request, env, ctx) {
