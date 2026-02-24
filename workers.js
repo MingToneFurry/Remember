@@ -5,6 +5,12 @@ const MAX_PARTS = 10000;
 const MAX_RECENT = 50;
 const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
 
+function ensureSecret(value, name) {
+  if (!value || typeof value !== "string" || value.length < 16) {
+    throw new HttpError(500, `${name} 未配置`);
+  }
+}
+
 class HttpError extends Error {
   constructor(status, message, details = undefined) {
     super(message);
@@ -77,6 +83,7 @@ async function sha256Text(text) {
 }
 
 async function issueSignedToken(env, payload, ttlSeconds) {
+  ensureSecret(env.TOKEN_SIGNING_SECRET, "TOKEN_SIGNING_SECRET");
   const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
   const fullPayload = { ...payload, exp };
   const body = btoa(JSON.stringify(fullPayload)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
@@ -85,13 +92,17 @@ async function issueSignedToken(env, payload, ttlSeconds) {
 }
 
 async function verifySignedToken(env, token) {
+  ensureSecret(env.TOKEN_SIGNING_SECRET, "TOKEN_SIGNING_SECRET");
   if (!token || !token.includes(".")) return null;
   const [body, sig] = token.split(".", 2);
   const expected = await sha256Text(`${body}.${env.TOKEN_SIGNING_SECRET}`);
   if (expected !== sig) return null;
 
   try {
-    const payload = JSON.parse(atob(body.replace(/-/g, "+").replace(/_/g, "/")));
+    const normalized = body.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = normalized.length % 4;
+    const padded = normalized + (pad ? "=".repeat(4 - pad) : "");
+    const payload = JSON.parse(atob(padded));
     if (!payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
     return payload;
   } catch {
@@ -123,9 +134,34 @@ async function enforceIpRateLimit(env, request, scope, maxPerDay) {
 }
 
 function requireAdminAccess(request) {
+  // 管理接口的真正鉴权应由 Cloudflare Access 在边缘强制拦截。
+  // 这里仅做最小兜底检查，避免明显未保护情况下直接放行。
   const email = request.headers.get("cf-access-authenticated-user-email");
   const jwt = request.headers.get("cf-access-jwt-assertion");
   if (!email || !jwt) throw new HttpError(403, "需要 Cloudflare Access");
+}
+
+function sanitizeFileName(input) {
+  const raw = String(input || "data.bin").slice(0, 200);
+  const cleaned = raw
+    .replace(/[\x00-\x1f\x7f]+/g, "")
+    .replace(/[\\/]+/g, "_")
+    .replace(/\.\.+/g, ".")
+    .trim();
+  return cleaned || "data.bin";
+}
+
+function applyCorsToResponse(response, cors) {
+  if (!cors || Object.keys(cors).length === 0) return response;
+  const headers = new Headers(response.headers);
+  for (const [k, v] of Object.entries(cors)) {
+    headers.set(k, v);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 function homepageHtml(siteKey) {
@@ -141,8 +177,10 @@ function homepageHtml(siteKey) {
   </script></body></html>`;
 }
 
-async function getRecent(env) {
-  return (await env.REMEMBER_KV.get("recent:list", "json")) || [];
+async function getRecent(env, limit = MAX_RECENT) {
+  const items = (await env.REMEMBER_KV.get("recent:list", "json")) || [];
+  const max = Math.max(1, Math.min(MAX_RECENT, Number(limit) || MAX_RECENT));
+  return Array.isArray(items) ? items.slice(0, max) : [];
 }
 
 async function saveRecent(env, item) {
@@ -208,33 +246,7 @@ async function handleProxy(request, env, url) {
 
   const r = await fetch(upstream, { cf: { cacheTtl: 0, cacheEverything: false } });
   const text = await r.text();
-
-  // Merge existing security headers with CORS headers and Vary: Origin
-  const baseHeaders = securityHeaders({
-    "content-type": "application/json; charset=utf-8",
-    "cache-control": "no-store",
-  });
-  const headers = new Headers(baseHeaders);
-
-  const origin = request.headers.get("Origin");
-  // Only allow configured domain to access this proxy
-  if (origin && origin === DOMAIN) {
-    headers.set("Access-Control-Allow-Origin", origin);
-    // If the proxy relies on cookies or auth, this allows them to be sent
-    headers.set("Access-Control-Allow-Credentials", "true");
-  }
-
-  // Ensure Vary includes Origin (without dropping any existing Vary values)
-  const existingVary = headers.get("Vary");
-  if (existingVary) {
-    if (!existingVary.split(",").map(v => v.trim().toLowerCase()).includes("origin")) {
-      headers.set("Vary", existingVary + ", Origin");
-    }
-  } else {
-    headers.set("Vary", "Origin");
-  }
-
-  return new Response(text, { status: r.status, headers });
+  return new Response(text, { status: r.status, headers: securityHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }) });
 }
 
 async function handleUploadInit(request, env) {
@@ -246,7 +258,7 @@ async function handleUploadInit(request, env) {
   await verifyTurnstile(request, env, body.turnstileToken);
   await enforceIpRateLimit(env, request, "upload-init", 20);
 
-  const fileName = String(body.fileName || "data.bin").slice(0, 200);
+  const fileName = sanitizeFileName(body.fileName);
   const mime = String(body.mime || "application/octet-stream").slice(0, 120);
   const objectPath = `raw/${new Date().toISOString().slice(0, 10)}/${uid}/${randomId("upload")}-${fileName}`;
   const upload = await env.REMEMBER_DATA.createMultipartUpload(objectPath, { httpMetadata: { contentType: mime } });
@@ -280,8 +292,23 @@ async function handleUploadComplete(request, env) {
   const session = await env.REMEMBER_KV.get(`upload:${uploadId}`, "json");
   if (!session) throw new HttpError(404, "上传会话不存在");
 
+  const normalizedParts = parts.map((x) => ({
+    partNumber: Number(x.partNumber),
+    etag: String(x.etag || "").trim(),
+  }));
+  const seen = new Set();
+  for (const part of normalizedParts) {
+    if (!Number.isInteger(part.partNumber) || part.partNumber < 1 || part.partNumber > MAX_PARTS) {
+      throw new HttpError(400, "分片编号不合法");
+    }
+    if (!part.etag) throw new HttpError(400, "分片 etag 不合法");
+    if (seen.has(part.partNumber)) throw new HttpError(400, "分片编号重复");
+    seen.add(part.partNumber);
+  }
+  normalizedParts.sort((a, b) => a.partNumber - b.partNumber);
+
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
-  await multipart.complete(parts.map((x) => ({ partNumber: Number(x.partNumber), etag: String(x.etag) })));
+  await multipart.complete(normalizedParts);
   const idxKey = `uploads:index:${session.uid}`;
   const list = (await env.REMEMBER_KV.get(idxKey, "json")) || [];
   list.push({ uploadId, key: session.key, fileName: session.fileName, mime: session.mime, size: session.size, createdAt: Date.now() });
@@ -341,12 +368,16 @@ async function handleAdmin(request, env, url, ctx) {
   }
   if (request.method === "GET" && url.pathname === "/api/admin/requests") {
     const status = String(url.searchParams.get("status") || "pending");
-    const list = await env.REMEMBER_KV.list({ prefix: "removal:req:" });
     const out = [];
-    for (const k of list.keys) {
-      const v = await env.REMEMBER_KV.get(k.name, "json");
-      if (v && (!status || v.status === status)) out.push({ id: v.id, uid: v.uid, status: v.status, createdAt: v.createdAt });
-    }
+    let cursor;
+    do {
+      const list = await env.REMEMBER_KV.list({ prefix: "removal:req:", cursor });
+      for (const k of list.keys) {
+        const v = await env.REMEMBER_KV.get(k.name, "json");
+        if (v && (!status || v.status === status)) out.push({ id: v.id, uid: v.uid, status: v.status, createdAt: v.createdAt });
+      }
+      cursor = list.list_complete ? undefined : list.cursor;
+    } while (cursor);
     return jsonResponse({ items: out }, 200, { "cache-control": "no-store" });
   }
   const reqMatch = url.pathname.match(/^\/api\/admin\/requests\/([^/]+)\/(approve|reject)$/);
@@ -385,12 +416,17 @@ async function handleAdmin(request, env, url, ctx) {
 }
 
 async function sitemapXml(env) {
-  const list = await env.REMEMBER_KV.list({ prefix: "meta:uid:" });
+  const prefix = "meta:uid:";
   const urls = [];
-  for (const item of list.keys) {
-    const uid = item.name.slice("meta:uid:".length);
-    if (normalizeUid(uid)) urls.push(`<url><loc>${DOMAIN}/u/${uid}</loc></url>`);
-  }
+  let cursor;
+  do {
+    const list = await env.REMEMBER_KV.list({ prefix, cursor });
+    for (const item of list.keys) {
+      const uid = item.name.slice(prefix.length);
+      if (normalizeUid(uid)) urls.push(`<url><loc>${DOMAIN}/u/${uid}</loc></url>`);
+    }
+    cursor = list.list_complete ? undefined : list.cursor;
+  } while (cursor);
   return `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${DOMAIN}/</loc></url>${urls.join("")}</urlset>`;
 }
 
@@ -411,19 +447,22 @@ async function handleFetch(request, env, ctx) {
       if (!uid) throw new HttpError(404, "not found");
       const obj = await env.REMEMBER_DATA.get(`pages/${uid}.html`);
       if (!obj) throw new HttpError(404, "not found");
-      return new Response(await obj.text(), { headers: { ...cors, "content-type": "text/html; charset=utf-8", "cache-control": "public, s-maxage=86400, stale-while-revalidate=604800" } });
+      return htmlResponse(await obj.text(), 200, { ...cors, "cache-control": "public, s-maxage=86400, stale-while-revalidate=604800" });
     }
 
-    if (request.method === "GET" && path === "/api/recent") return jsonResponse({ items: await getRecent(env) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
-    if (request.method === "GET" && path.startsWith("/api/proxy/")) return handleProxy(request, env, url);
-    if (request.method === "POST" && path === "/api/upload/init") return handleUploadInit(request, env);
-    if (request.method === "PUT" && path === "/api/upload/part") return handleUploadPart(request, env, url);
-    if (request.method === "POST" && path === "/api/upload/complete") return handleUploadComplete(request, env);
-    if (request.method === "POST" && path === "/api/generate") return handleGenerate(request, env, ctx);
-    if (request.method === "GET" && path.startsWith("/api/job/")) return handleJob(env, path.split("/").pop());
-    if (request.method === "POST" && path === "/api/removal-requests") return handleRemovalCreate(request, env);
-    if (request.method === "GET" && path.startsWith("/api/removal-requests/")) return handleRemovalGet(env, url);
-    if (path === "/admin" || path.startsWith("/api/admin/")) return handleAdmin(request, env, url, ctx);
+    if (request.method === "GET" && path === "/api/recent") {
+      const limit = Math.max(1, Math.min(MAX_RECENT, Number(url.searchParams.get("limit") || MAX_RECENT)));
+      return jsonResponse({ items: await getRecent(env, limit) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
+    }
+    if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url), cors);
+    if (request.method === "POST" && path === "/api/upload/init") return applyCorsToResponse(await handleUploadInit(request, env), cors);
+    if (request.method === "PUT" && path === "/api/upload/part") return applyCorsToResponse(await handleUploadPart(request, env, url), cors);
+    if (request.method === "POST" && path === "/api/upload/complete") return applyCorsToResponse(await handleUploadComplete(request, env), cors);
+    if (request.method === "POST" && path === "/api/generate") return applyCorsToResponse(await handleGenerate(request, env, ctx), cors);
+    if (request.method === "GET" && path.startsWith("/api/job/")) return applyCorsToResponse(await handleJob(env, path.split("/").pop()), cors);
+    if (request.method === "POST" && path === "/api/removal-requests") return applyCorsToResponse(await handleRemovalCreate(request, env), cors);
+    if (request.method === "GET" && path.startsWith("/api/removal-requests/")) return applyCorsToResponse(await handleRemovalGet(env, url), cors);
+    if (path === "/admin" || path.startsWith("/api/admin/")) return applyCorsToResponse(await handleAdmin(request, env, url, ctx), cors);
 
     throw new HttpError(404, "Not Found");
   } catch (err) {

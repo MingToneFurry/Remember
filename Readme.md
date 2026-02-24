@@ -19,7 +19,7 @@
 - `GET /robots.txt`
 
 ### 2. 公共 API
-- `GET /api/recent?limit=`：最近生成列表
+- `GET /api/recent?limit=`：最近生成列表（`limit` 1~50）
 - `GET /api/proxy/:source`：白名单代理（`allVid/comment/vidInfo`）
 - `POST /api/upload/init`：初始化分片上传
 - `PUT /api/upload/part`：上传分片
@@ -68,7 +68,7 @@
    - CSP + 基础安全响应头。
 
 5. **权限隔离**
-   - admin 路由必须带 Cloudflare Access 头。
+   - admin 路由必须由 Cloudflare Access 在边缘强制保护（Worker 内仅做兜底检查，不应单独依赖请求头存在性）。
 
 6. **防刷限制**
    - 按 IP 的每日限流：代理/生成/上传初始化。
@@ -127,7 +127,7 @@ wrangler dev
 ## 5) 发布
 
 ```bash
-wrangler deploy
+wrangler deploy --env production
 ```
 
 ## 6) 上线核验清单
