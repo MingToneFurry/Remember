@@ -13,6 +13,9 @@ const MAX_ADMIN_REQUESTS_PAGE_SIZE = 200;
 const MAX_SITEMAP_URLS = 50000;
 const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
 const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
+const JOB_ID_REGEX = /^job_[a-f0-9]{32}$/;
+const PUBLIC_ERROR_DETAIL_LIMIT = 5;
+const PUBLIC_ERROR_TEXT_LIMIT = 160;
 const upstreamClient = createDefaultUpstreamClient(fetch);
 
 function ensureSecret(value, name) {
@@ -35,7 +38,7 @@ function corsHeaders(origin) {
     return {
       "access-control-allow-origin": origin,
       "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
-      "access-control-allow-headers": "content-type,x-upload-token,x-upload-session-token",
+      "access-control-allow-headers": "content-type,x-upload-token,x-upload-session-token,x-request-id",
       "access-control-max-age": "86400",
       vary: "Origin",
     };
@@ -49,6 +52,9 @@ function securityHeaders(base = {}) {
   h.set("x-frame-options", "DENY");
   h.set("referrer-policy", "strict-origin-when-cross-origin");
   h.set("permissions-policy", "geolocation=(), microphone=(), camera=()");
+   h.set("cross-origin-opener-policy", "same-origin");
+   h.set("cross-origin-resource-policy", "same-site");
+   h.set("strict-transport-security", "max-age=31536000; includeSubDomains; preload");
   return h;
 }
 
@@ -58,12 +64,14 @@ function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), { status, headers: h });
 }
 
-function htmlResponse(html, status = 200, headers = {}) {
+function htmlResponse(html, status = 200, headers = {}, options = {}) {
+  const nonce = String(options.nonce || "").trim();
+  const scriptSrc = nonce ? `'self' 'nonce-${nonce}' https://challenges.cloudflare.com` : "'self' https://challenges.cloudflare.com";
   const h = securityHeaders(headers);
   h.set("content-type", "text/html; charset=utf-8");
   h.set(
     "content-security-policy",
-    "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; base-uri 'none'; form-action 'self';",
+    `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';`,
   );
   return new Response(html, { status, headers: h });
 }
@@ -82,9 +90,65 @@ function safeText(value) {
     .replaceAll("'", "&#39;");
 }
 
+function normalizeJobId(input) {
+  const raw = String(input || "").trim();
+  return JOB_ID_REGEX.test(raw) ? raw : null;
+}
+
+function sanitizePublicDetails(details) {
+  if (!Array.isArray(details)) return [];
+  return details
+    .filter((item) => item !== null && item !== undefined)
+    .slice(0, PUBLIC_ERROR_DETAIL_LIMIT)
+    .map((item) => String(item).slice(0, PUBLIC_ERROR_TEXT_LIMIT));
+}
+
+function publicErrorPayload(err, requestId = "unknown") {
+  if (err instanceof HttpError) {
+    if (err.status >= 500) {
+      return {
+        status: err.status,
+        body: {
+          error: "服务暂时不可用",
+          details: [],
+          requestId,
+        },
+      };
+    }
+    return {
+      status: err.status,
+      body: {
+        error: err.message,
+        details: sanitizePublicDetails(err.details),
+      },
+    };
+  }
+
+  return {
+    status: 500,
+    body: {
+      error: "Internal Error",
+      details: [],
+      requestId,
+    },
+  };
+}
+
+function sanitizeFailureMessage(input) {
+  return String(input || "unknown")
+    .replace(/(token|secret|authorization)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
+    .replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]")
+    .slice(0, 220);
+}
+
 function randomId(prefix = "id") {
   const arr = crypto.getRandomValues(new Uint8Array(16));
   return `${prefix}_${Array.from(arr, (n) => n.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function generateCspNonce() {
+  const arr = crypto.getRandomValues(new Uint8Array(18));
+  return btoa(String.fromCharCode(...arr)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
 async function sha256Text(text) {
@@ -163,13 +227,21 @@ async function verifyTurnstile(request, env, token) {
   if (!data.success) throw new HttpError(403, "Turnstile 校验失败", data["error-codes"] ?? []);
 }
 
-async function enforceIpRateLimit(env, request, scope, maxPerDay) {
+async function enforceIpRateLimit(env, request, scope, maxPerDay, maxPerMinute = 0) {
   const ip = request.headers.get("cf-connecting-ip") || "0.0.0.0";
+  const now = new Date();
   const day = new Date().toISOString().slice(0, 10);
   const key = `rl:ip:${scope}:${ip}:${day}`;
   const current = Number((await env.REMEMBER_KV.get(key)) || "0") + 1;
   await env.REMEMBER_KV.put(key, String(current), { expirationTtl: 2 * 24 * 3600 });
   if (current > maxPerDay) throw new HttpError(429, "请求过于频繁，请明天再试");
+  if (maxPerMinute > 0) {
+    const minute = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(2, "0")}${String(now.getUTCDate()).padStart(2, "0")}${String(now.getUTCHours()).padStart(2, "0")}${String(now.getUTCMinutes()).padStart(2, "0")}`;
+    const minuteKey = `rl:ipm:${scope}:${ip}:${minute}`;
+    const minuteCount = Number((await env.REMEMBER_KV.get(minuteKey)) || "0") + 1;
+    await env.REMEMBER_KV.put(minuteKey, String(minuteCount), { expirationTtl: 2 * 3600 });
+    if (minuteCount > maxPerMinute) throw new HttpError(429, "请求过于频繁，请稍后重试");
+  }
 }
 
 function requireAdminAccess(request) {
@@ -313,7 +385,7 @@ function applyCorsToResponse(response, cors) {
   });
 }
 
-function homepageHtml(siteKey) {
+function homepageHtml(siteKey, scriptNonce = "") {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Remember</title>
   <style>
   body{font-family:system-ui,-apple-system,sans-serif;background:#f4f7fc;padding:20px;color:#1f2a3d}
@@ -332,7 +404,7 @@ function homepageHtml(siteKey) {
   ul{padding-left:18px}
   .recent{margin-top:16px}
   </style>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box">
+  <script nonce="${safeText(scriptNonce)}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box">
   <h1>Remember 纪念页生成</h1>
   <p>输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。</p>
   <form id="generate-form">
@@ -350,7 +422,7 @@ function homepageHtml(siteKey) {
   </div>
   <div class="recent"><h2>最近生成</h2><ul id="recent-list"></ul></div>
   </div>
-  <script>
+  <script nonce="${safeText(scriptNonce)}">
   const STAGE_LABELS={queued:'排队中',fetching:'抓取数据',analyzing:'模型分析',rendering:'渲染页面',syncing:'同步产物',succeeded:'已完成',failed:'已失败'};
   const statusLine=document.getElementById('status-line');
   const stageLine=document.getElementById('stage-line');
@@ -570,17 +642,38 @@ async function processGenerateJob(env, jobId) {
     }
     await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url, warnings, gitSync });
   } catch (err) {
+    const safeMessage = sanitizeFailureMessage(err?.message || err);
     await patchJob({
       status: "failed",
       stage: "failed",
-      error: String(err?.message || err),
-      warnings: [`任务失败: ${String(err?.message || err)}`],
+      error: safeMessage,
+      warnings: [`任务失败: ${safeMessage}`],
     });
   }
 }
 
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function sanitizeSearchKeyword(input) {
+  return String(input || "").trim().slice(0, 64);
+}
+
+function proxySchemaValidator(source, payload) {
+  if (!isPlainObject(payload)) return false;
+  if (source === "allVid") {
+    return Array.isArray(payload.videos) || Array.isArray(payload?.data?.videos) || Number.isFinite(Number(payload.total || payload?.data?.total || 0));
+  }
+  if (source === "vidInfo") {
+    return Boolean(payload.aid || payload.bvid || payload?.data?.aid || payload?.data?.bvid);
+  }
+  const list = payload?.data?.list || payload?.list || payload?.data?.reply || payload?.reply;
+  return Array.isArray(list) || Number.isFinite(Number(payload.code ?? 0));
+}
+
 async function handleProxy(request, env, url) {
-  await enforceIpRateLimit(env, request, "proxy", 60);
+  await enforceIpRateLimit(env, request, "proxy", 120, 30);
   const source = url.pathname.split("/").pop();
   const uid = normalizeUid(url.searchParams.get("uid"));
   const bvid = String(url.searchParams.get("bvid") || "").trim();
@@ -599,12 +692,12 @@ async function handleProxy(request, env, url) {
   } else if (source === "danmu") {
     if (!uid) throw new HttpError(400, "danmu 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
-    const keyword = String(url.searchParams.get("keyword") || "");
+    const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
     upstream = `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
   } else if (source === "zhibodanmu") {
     if (!uid) throw new HttpError(400, "zhibodanmu 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
-    const keyword = String(url.searchParams.get("keyword") || "");
+    const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
     upstream = `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
   } else {
     if (bvid && /^BV[0-9A-Za-z]{10}$/.test(bvid)) {
@@ -619,16 +712,11 @@ async function handleProxy(request, env, url) {
   let payload;
   try {
     const { data } = await upstreamClient.requestJson(upstream, {
-      schema: (data) => {
-        if (!data || typeof data !== "object") return false;
-        if (source === "allVid") return Array.isArray(data.videos) || Array.isArray(data?.data?.videos) || Number.isInteger(Number(data.total || data?.data?.total || 0));
-        if (source === "vidInfo") return Boolean(data.aid || data.bvid || data?.data?.aid || data?.data?.bvid);
-        return Number.isFinite(Number(data.code ?? 0)) || Array.isArray(data?.data?.list);
-      },
+      schema: (data) => proxySchemaValidator(source, data),
     });
     payload = data;
   } catch (err) {
-    throw new HttpError(502, "上游接口请求失败", [String(err?.message || err)]);
+    throw new HttpError(502, "上游接口请求失败");
   }
 
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
@@ -644,7 +732,7 @@ async function handleUploadInit(request, env) {
   const size = Number(body.size || 0);
   if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_SIZE) throw new HttpError(400, "上传大小不合法");
   await verifyTurnstile(request, env, body.turnstileToken);
-  await enforceIpRateLimit(env, request, "upload-init", 20);
+  await enforceIpRateLimit(env, request, "upload-init", 20, 8);
 
   const fileName = sanitizeFileName(body.fileName);
   const mime = String(body.mime || "application/octet-stream").slice(0, 120);
@@ -711,7 +799,7 @@ async function handleGenerate(request, env, ctx) {
   const uid = normalizeUid(body.uid);
   if (!uid) throw new HttpError(400, "uid 不合法");
   await verifyTurnstile(request, env, body.turnstileToken);
-  await enforceIpRateLimit(env, request, "generate", 5);
+  await enforceIpRateLimit(env, request, "generate", 10, 4);
 
   const cooldownKey = `cooldown:uid:${uid}`;
   const existingCooldown = await env.REMEMBER_KV.get(cooldownKey);
@@ -759,7 +847,9 @@ async function handleGenerate(request, env, ctx) {
 }
 
 async function handleJob(env, jobId) {
-  const job = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+  const normalizedJobId = normalizeJobId(jobId);
+  if (!normalizedJobId) throw new HttpError(400, "jobId 不合法");
+  const job = await env.REMEMBER_KV.get(`job:${normalizedJobId}`, "json");
   if (!job) throw new HttpError(404, "任务不存在");
   const normalized = {
     ...job,
@@ -777,6 +867,7 @@ async function handleRemovalCreate(request, env) {
   const uid = normalizeUid(body.uid);
   if (!uid) throw new HttpError(400, "uid 不合法");
   await verifyTurnstile(request, env, body.turnstileToken);
+  await enforceIpRateLimit(env, request, "removal-create", 8, 3);
   const id = randomId("rr");
   const code = randomId("code");
   const reason = String(body.reason || "").slice(0, 1000).trim();
@@ -788,6 +879,9 @@ async function handleRemovalGet(env, url) {
   const parts = url.pathname.split("/");
   const id = parts[parts.length - 1];
   const code = String(url.searchParams.get("code") || "");
+  if (!/^rr_[a-f0-9]{32}$/.test(id) || !/^code_[a-f0-9]{32}$/.test(code)) {
+    throw new HttpError(400, "参数不合法");
+  }
   const req = await env.REMEMBER_KV.get(`removal:req:${id}`, "json");
   if (!req || req.code !== code) throw new HttpError(403, "查询码错误");
   return jsonResponse({ id: req.id, uid: req.uid, status: req.status, createdAt: req.createdAt }, 200, { "cache-control": "no-store" });
@@ -930,11 +1024,15 @@ async function handleFetch(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/";
   const cors = corsHeaders(request.headers.get("origin"));
+  const requestId = request.headers.get("cf-ray") || randomId("req");
 
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
 
   try {
-    if (request.method === "GET" && path === "/") return htmlResponse(homepageHtml(env.TURNSTILE_SITE_KEY || ""), 200, { ...cors, "cache-control": "public, s-maxage=300" });
+    if (request.method === "GET" && path === "/") {
+      const nonce = generateCspNonce();
+      return htmlResponse(homepageHtml(env.TURNSTILE_SITE_KEY || "", nonce), 200, { ...cors, "cache-control": "public, s-maxage=300", "x-request-id": requestId }, { nonce });
+    }
     if (request.method === "GET" && path === "/robots.txt") return new Response("User-agent: *\nAllow: /\nSitemap: https://rem.furry.ist/sitemap.xml\n", { headers: { ...cors, "content-type": "text/plain; charset=utf-8", "cache-control": "public, s-maxage=86400" } });
     if (request.method === "GET" && path === "/sitemap.xml") return new Response(await sitemapXml(env), { headers: { ...cors, "content-type": "application/xml; charset=utf-8", "cache-control": "public, s-maxage=3600" } });
 
@@ -947,6 +1045,7 @@ async function handleFetch(request, env, ctx) {
     }
 
     if (request.method === "GET" && path === "/api/recent") {
+      await enforceIpRateLimit(env, request, "recent", 1200, 120);
       const limit = parseBoundedInt(url.searchParams.get("limit"), 1, MAX_RECENT, MAX_RECENT);
       return jsonResponse({ items: await getRecent(env, limit) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
     }
@@ -955,15 +1054,21 @@ async function handleFetch(request, env, ctx) {
     if (request.method === "PUT" && path === "/api/upload/part") return applyCorsToResponse(await handleUploadPart(request, env, url), cors);
     if (request.method === "POST" && path === "/api/upload/complete") return applyCorsToResponse(await handleUploadComplete(request, env), cors);
     if (request.method === "POST" && path === "/api/generate") return applyCorsToResponse(await handleGenerate(request, env, ctx), cors);
-    if (request.method === "GET" && path.startsWith("/api/job/")) return applyCorsToResponse(await handleJob(env, path.split("/").pop()), cors);
+    if (request.method === "GET" && path.startsWith("/api/job/")) {
+      await enforceIpRateLimit(env, request, "job", 1500, 180);
+      return applyCorsToResponse(await handleJob(env, path.split("/").pop()), cors);
+    }
     if (request.method === "POST" && path === "/api/removal-requests") return applyCorsToResponse(await handleRemovalCreate(request, env), cors);
     if (request.method === "GET" && path.startsWith("/api/removal-requests/")) return applyCorsToResponse(await handleRemovalGet(env, url), cors);
     if (path === "/admin" || path.startsWith("/api/admin/")) return applyCorsToResponse(await handleAdmin(request, env, url, ctx), cors);
 
     throw new HttpError(404, "Not Found");
   } catch (err) {
-    if (err instanceof HttpError) return jsonResponse({ error: err.message, details: err.details || [] }, err.status, { ...cors, "cache-control": "no-store" });
-    return jsonResponse({ error: "Internal Error", details: [String(err?.message || err)] }, 500, { ...cors, "cache-control": "no-store" });
+    if (!(err instanceof HttpError)) {
+      console.error("unhandled_error", { requestId, path, message: String(err?.message || err) });
+    }
+    const publicErr = publicErrorPayload(err, requestId);
+    return jsonResponse(publicErr.body, publicErr.status, { ...cors, "cache-control": "no-store", "x-request-id": requestId });
   }
 }
 
@@ -1006,7 +1111,7 @@ async function handleQueue(batch, env) {
   for (const message of batch.messages || []) {
     try {
       const payload = await parseQueueMessageBody(message.body);
-      const jobId = String(payload?.jobId || "").trim();
+      const jobId = normalizeJobId(payload?.jobId);
       const uid = normalizeUid(payload?.uid);
       if (!jobId || !uid) {
         if (typeof message.ack === "function") message.ack();
