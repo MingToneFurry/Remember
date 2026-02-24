@@ -1,4 +1,4 @@
-import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
+﻿import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
 import { analyzeWithGrok } from "../services/grokAnalyzer.js";
 import { syncGeneratedPageToGitHub } from "../services/githubSync.js";
 import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData, fetchTopVideoInfosByPlayCount } from "../services/memorialData.js";
@@ -315,14 +315,172 @@ function applyCorsToResponse(response, cors) {
 
 function homepageHtml(siteKey) {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Remember</title>
-  <style>body{font-family:system-ui,-apple-system,sans-serif;background:#f5f7fb;padding:20px}.box{max-width:960px;margin:0 auto;background:#fff;border:1px solid #dfe6f3;border-radius:12px;padding:16px}input,button{padding:10px;border-radius:8px;border:1px solid #c8d3e5}button{background:#2056d8;color:#fff;cursor:pointer}ul{padding-left:18px}</style>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box"><h1>rem.furry.ist 纪念页</h1><p>输入 UID 生成专属页面，上传数据后可增强页面内容。</p>
-  <input id="uid" inputmode="numeric" maxlength="20" placeholder="UID"/><button id="gen">生成页面</button><div class="cf-turnstile" data-sitekey="${safeText(siteKey)}"></div><p id="status"></p>
-  <h2>最近生成</h2><ul id="recent"></ul></div>
+  <style>
+  body{font-family:system-ui,-apple-system,sans-serif;background:#f4f7fc;padding:20px;color:#1f2a3d}
+  .box{max-width:980px;margin:0 auto;background:#fff;border:1px solid #dbe4f4;border-radius:12px;padding:18px}
+  form{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start}
+  input,button{padding:10px 12px;border-radius:8px;border:1px solid #c8d4eb}
+  button{background:#1c57d7;color:#fff;cursor:pointer}
+  button[disabled]{opacity:.65;cursor:not-allowed}
+  .full{grid-column:1 / -1}
+  .hint{font-size:12px;color:#4b5f87}
+  .status{margin-top:14px;padding:12px;border:1px solid #dbe4f5;border-radius:10px;background:#f8fbff}
+  .bar{height:8px;background:#e8eefb;border-radius:999px;overflow:hidden;margin-top:8px}
+  .bar > span{display:block;height:100%;background:#2d63d8;width:0;transition:width .2s ease}
+  .warn{color:#7a4e00;margin:10px 0 0;padding-left:18px}
+  .error{color:#a22121}
+  ul{padding-left:18px}
+  .recent{margin-top:16px}
+  </style>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box">
+  <h1>Remember 纪念页生成</h1>
+  <p>输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。</p>
+  <form id="generate-form">
+    <input id="uid" inputmode="numeric" maxlength="20" placeholder="请输入 UID" autocomplete="off"/>
+    <button id="submit-btn" type="submit">创建任务</button>
+    <div class="cf-turnstile full" data-sitekey="${safeText(siteKey)}"></div>
+    <div id="source-hint" class="hint full"></div>
+  </form>
+  <div id="job-status" class="status">
+    <div id="status-line">等待提交任务</div>
+    <div id="stage-line" class="hint">阶段: -</div>
+    <div class="bar"><span id="progress-bar"></span></div>
+    <ul id="warning-list" class="warn"></ul>
+    <div id="error-line" class="error"></div>
+  </div>
+  <div class="recent"><h2>最近生成</h2><ul id="recent-list"></ul></div>
+  </div>
   <script>
-  async function loadRecent(){const r=await fetch('/api/recent');const d=await r.json();const ul=document.getElementById('recent');ul.innerHTML=(d.items||[]).map(i=>'<li><a href="/u/'+encodeURIComponent(i.uid)+'">UID '+i.uid+'</a> · '+new Date(i.createdAt).toLocaleString()+'</li>').join('')||'<li>暂无</li>';}
-  async function gen(){const uid=document.getElementById('uid').value.trim();const token=window.turnstile?.getResponse();const s=document.getElementById('status');s.textContent='处理中...';const r=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken:token})});const d=await r.json();if(!r.ok){s.textContent=d.error||'失败';return;}s.textContent='任务已提交';const jobId=d.jobId;for(let i=0;i<90;i++){await new Promise(x=>setTimeout(x,1500));const jr=await fetch('/api/job/'+encodeURIComponent(jobId));const jd=await jr.json();if(jd.status==='succeeded'){location.href=jd.url;return;}if(jd.status==='failed'){s.textContent='失败:'+jd.error;return;}}s.textContent='任务超时';}
-  document.getElementById('gen').onclick=gen;loadRecent();
+  const STAGE_LABELS={queued:'排队中',fetching:'抓取数据',analyzing:'模型分析',rendering:'渲染页面',syncing:'同步产物',succeeded:'已完成',failed:'已失败'};
+  const statusLine=document.getElementById('status-line');
+  const stageLine=document.getElementById('stage-line');
+  const progressBar=document.getElementById('progress-bar');
+  const warningList=document.getElementById('warning-list');
+  const errorLine=document.getElementById('error-line');
+  const sourceHint=document.getElementById('source-hint');
+  const submitBtn=document.getElementById('submit-btn');
+  const uidInput=document.getElementById('uid');
+
+  function sleep(ms){return new Promise((r)=>setTimeout(r,ms));}
+  function setStatus(text){statusLine.textContent=text;}
+  function setStage(stage,progress){
+    const label=STAGE_LABELS[stage]||stage||'-';
+    stageLine.textContent='阶段: '+label;
+    const safeProgress=Number.isFinite(Number(progress))?Math.max(0,Math.min(100,Number(progress))):0;
+    progressBar.style.width=safeProgress+'%';
+  }
+  function renderWarnings(warnings){
+    const list=Array.isArray(warnings)?warnings.filter(Boolean):[];
+    warningList.innerHTML=list.map((w)=>'<li>'+String(w)+'</li>').join('');
+  }
+
+  async function loadRecent(){
+    const ul=document.getElementById('recent-list');
+    try{
+      const resp=await fetch('/api/recent?limit=10',{headers:{accept:'application/json'}});
+      const data=await resp.json();
+      const items=Array.isArray(data.items)?data.items:[];
+      ul.innerHTML=items.map((item)=>'<li><a href="/u/'+encodeURIComponent(item.uid)+'">UID '+String(item.uid)+'</a> · '+new Date(item.createdAt).toLocaleString()+'</li>').join('')||'<li>暂无数据</li>';
+    }catch{
+      ul.innerHTML='<li>加载失败，请稍后刷新</li>';
+    }
+  }
+
+  async function fetchAllVidWithRetry(uid){
+    const directUrl='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(uid)+'&ps=1&pn=1';
+    let lastError='未知错误';
+    for(let attempt=1;attempt<=3;attempt++){
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),4000);
+      try{
+        const resp=await fetch(directUrl,{signal:controller.signal,headers:{accept:'application/json'}});
+        if(!resp.ok) throw new Error('HTTP '+resp.status);
+        const data=await resp.json();
+        if(!data||typeof data!=='object') throw new Error('payload invalid');
+        return {via:'direct',attempt,data};
+      }catch(err){
+        lastError=String(err&&err.message?err.message:err);
+        await sleep(200*attempt);
+      }finally{
+        clearTimeout(timer);
+      }
+    }
+    const proxyResp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
+    if(!proxyResp.ok){
+      throw new Error('代理请求失败 HTTP '+proxyResp.status+'; direct error: '+lastError);
+    }
+    return {via:'worker-proxy',attempt:4,data:await proxyResp.json(),fallback:lastError};
+  }
+
+  async function pollJob(jobId){
+    for(let i=0;i<240;i++){
+      await sleep(1500);
+      const resp=await fetch('/api/job/'+encodeURIComponent(jobId),{headers:{accept:'application/json'}});
+      const job=await resp.json();
+      if(!resp.ok){
+        errorLine.textContent=String(job.error||'任务状态查询失败');
+        return;
+      }
+      setStage(job.stage,job.progress);
+      renderWarnings(job.warnings);
+      if(job.status==='succeeded'){
+        setStatus('任务完成，正在跳转页面');
+        if(job.url){
+          location.href=job.url;
+          return;
+        }
+        await loadRecent();
+        return;
+      }
+      if(job.status==='failed'){
+        setStatus('任务失败');
+        errorLine.textContent=String(job.error||'未知错误');
+        return;
+      }
+      const waitSec=Math.max(0,Math.round((240-i)*1.5));
+      setStatus('任务进行中，预计剩余轮询 '+waitSec+' 秒');
+    }
+    setStatus('任务超时，请稍后重新查询');
+  }
+
+  async function onSubmit(event){
+    event.preventDefault();
+    errorLine.textContent='';
+    renderWarnings([]);
+    const uid=String(uidInput.value||'').trim();
+    if(!/^\d{1,20}$/.test(uid)){
+      errorLine.textContent='UID 格式错误';
+      return;
+    }
+    submitBtn.disabled=true;
+    try{
+      setStatus('检查数据源连通性');
+      setStage('queued',0);
+      const source=await fetchAllVidWithRetry(uid);
+      if(source.via==='direct'){
+        sourceHint.textContent='上游直连成功（'+source.attempt+' 次尝试）';
+      }else{
+        sourceHint.textContent='上游直连失败 3 次，已切换 Worker 代理。';
+      }
+      const turnstileToken=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
+      const resp=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken})});
+      const data=await resp.json();
+      if(!resp.ok){
+        throw new Error(String(data.error||'任务创建失败'));
+      }
+      setStatus('任务已入队，预计等待 '+String(data.estimatedWaitSec||'-')+' 秒');
+      setStage(data.stage||'queued',0);
+      await pollJob(data.jobId);
+      await loadRecent();
+    }catch(err){
+      errorLine.textContent=String(err&&err.message?err.message:err);
+    }finally{
+      submitBtn.disabled=false;
+    }
+  }
+
+  document.getElementById('generate-form').addEventListener('submit',onSubmit);
+  loadRecent();
   </script></body></html>`;
 }
 
@@ -877,3 +1035,4 @@ export default {
     ctx.waitUntil(handleQueue(batch, env));
   },
 };
+
