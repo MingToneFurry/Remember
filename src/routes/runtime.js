@@ -1,3 +1,5 @@
+import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
+
 const DOMAIN = "https://rem.furry.ist";
 const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;
 const PART_SIZE_HINT = 8 * 1024 * 1024;
@@ -7,6 +9,7 @@ const MAX_ADMIN_REQUESTS_PAGE_SIZE = 200;
 const MAX_SITEMAP_URLS = 50000;
 const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
 const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
+const upstreamClient = createDefaultUpstreamClient(fetch);
 
 function ensureSecret(value, name) {
   if (!value || typeof value !== "string" || value.length < 16) {
@@ -493,8 +496,8 @@ async function handleProxy(request, env, url) {
   const source = url.pathname.split("/").pop();
   const uid = normalizeUid(url.searchParams.get("uid"));
   const bvid = String(url.searchParams.get("bvid") || "").trim();
-  if (!["allVid", "comment", "vidInfo"].includes(source)) throw new HttpError(400, "source 不合法");
-  if (!uid && !bvid) throw new HttpError(400, "缺少 uid/bvid 参数");
+  const aid = String(url.searchParams.get("aid") || "").trim();
+  if (!["allVid", "comment", "vidInfo", "danmu", "zhibodanmu"].includes(source)) throw new HttpError(400, "source 不合法");
 
   let upstream;
   if (source === "allVid") {
@@ -502,17 +505,48 @@ async function handleProxy(request, env, url) {
     const pn = parseBoundedInt(url.searchParams.get("pn"), 1, 200, 1);
     upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=50&pn=${pn}`;
   } else if (source === "comment") {
-    const page = parseBoundedInt(url.searchParams.get("page"), 1, 1000, 1);
-    if (!bvid || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new HttpError(400, "comment 需要合法 bvid");
-    upstream = `https://uapis.cn/api/v1/social/bilibili/replies?bvid=${encodeURIComponent(bvid)}&pn=${page}`;
+    if (!uid) throw new HttpError(400, "comment 需要 uid");
+    const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
+    upstream = `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&mode=0`;
+  } else if (source === "danmu") {
+    if (!uid) throw new HttpError(400, "danmu 需要 uid");
+    const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
+    const keyword = String(url.searchParams.get("keyword") || "");
+    upstream = `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
+  } else if (source === "zhibodanmu") {
+    if (!uid) throw new HttpError(400, "zhibodanmu 需要 uid");
+    const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
+    const keyword = String(url.searchParams.get("keyword") || "");
+    upstream = `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
   } else {
-    if (!bvid || !/^BV[0-9A-Za-z]{10}$/.test(bvid)) throw new HttpError(400, "vidInfo 需要合法 bvid");
-    upstream = `https://uapis.cn/api/v1/social/bilibili/view?bvid=${encodeURIComponent(bvid)}`;
+    if (bvid && /^BV[0-9A-Za-z]{10}$/.test(bvid)) {
+      upstream = `https://uapis.cn/api/v1/social/bilibili/view?bvid=${encodeURIComponent(bvid)}`;
+    } else if (/^\d+$/.test(aid)) {
+      upstream = `https://uapis.cn/api/v1/social/bilibili/view?aid=${encodeURIComponent(aid)}`;
+    } else {
+      throw new HttpError(400, "vidInfo 需要合法 bvid 或 aid");
+    }
   }
 
-  const r = await fetch(upstream, { cf: { cacheTtl: 0, cacheEverything: false } });
-  const text = await r.text();
-  return new Response(text, { status: r.status, headers: securityHeaders({ "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }) });
+  let payload;
+  try {
+    const { data } = await upstreamClient.requestJson(upstream, {
+      schema: (data) => {
+        if (!data || typeof data !== "object") return false;
+        if (source === "allVid") return Array.isArray(data.videos) || Array.isArray(data?.data?.videos) || Number.isInteger(Number(data.total || data?.data?.total || 0));
+        if (source === "vidInfo") return Boolean(data.aid || data.bvid || data?.data?.aid || data?.data?.bvid);
+        return Number.isFinite(Number(data.code ?? 0)) || Array.isArray(data?.data?.list);
+      },
+    });
+    payload = data;
+  } catch (err) {
+    throw new HttpError(502, "上游接口请求失败", [String(err?.message || err)]);
+  }
+
+  if (payload && typeof payload === "object" && !Array.isArray(payload)) {
+    payload.dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
+  }
+  return jsonResponse(payload, 200, { "cache-control": "no-store" });
 }
 
 async function handleUploadInit(request, env) {
