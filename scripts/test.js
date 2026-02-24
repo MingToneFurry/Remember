@@ -18,6 +18,7 @@ const unit = spawnSync(
     "tests/grok-analyzer.test.js",
     "tests/github-sync.test.js",
     "tests/template-xss.test.js",
+    "tests/runtime-routes.test.js",
   ],
   {
   stdio: "inherit",
