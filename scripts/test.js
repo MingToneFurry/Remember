@@ -16,6 +16,7 @@ const unit = spawnSync(
     "tests/upstream-client.test.js",
     "tests/memorial-data.test.js",
     "tests/grok-analyzer.test.js",
+    "tests/github-sync.test.js",
     "tests/template-xss.test.js",
   ],
   {

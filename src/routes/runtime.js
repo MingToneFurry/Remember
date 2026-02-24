@@ -1,5 +1,6 @@
 import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
 import { analyzeWithGrok } from "../services/grokAnalyzer.js";
+import { syncGeneratedPageToGitHub } from "../services/githubSync.js";
 import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData, fetchTopVideoInfosByPlayCount } from "../services/memorialData.js";
 import { buildMemorialPage } from "../templates/memorialTemplate.js";
 
@@ -403,7 +404,11 @@ async function processGenerateJob(env, jobId) {
     await saveRecent(env, item);
 
     await patchJob({ stage: "syncing", progress: 95, warnings });
-    await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url, warnings });
+    const gitSync = await syncGeneratedPageToGitHub(env, { uid, html, snapshot, item });
+    if (gitSync.status !== "succeeded" && gitSync.reason) {
+      warnings.push(`Git 同步异常: ${gitSync.reason}`);
+    }
+    await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url, warnings, gitSync });
   } catch (err) {
     await patchJob({
       status: "failed",
