@@ -492,6 +492,10 @@ function homepageHtml(siteKey, scriptNonce = "") {
   .recent-list li:last-child{border-bottom:none}
   .recent-list a{text-decoration:none;border-bottom:1px solid transparent;transition:border-color var(--theme-motion) ease,color var(--theme-motion) ease}
   .recent-list a:hover{color:var(--theme-accent);border-bottom-color:var(--theme-accent)}
+  .verify-box{margin-top:8px;border:1px dashed var(--theme-line);border-radius:10px;padding:10px;background:var(--theme-card)}
+  .verify-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:8px}
+  .verify-link{display:inline-flex;align-items:center;justify-content:center;padding:8px 14px;border-radius:999px;border:1px solid var(--theme-line);text-decoration:none;color:var(--theme-fg)}
+  .verify-link:hover{border-color:var(--theme-accent);color:var(--theme-accent)}
   @media (max-width: 760px){.home-form{grid-template-columns:1fr}}
   </style>
   <script nonce="${safeText(scriptNonce)}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body>
@@ -512,6 +516,13 @@ function homepageHtml(siteKey, scriptNonce = "") {
         <button id="submit-btn" class="site-button" type="submit">创建任务</button>
         <div class="cf-turnstile full" data-sitekey="${safeText(siteKey)}"></div>
         <div id="source-hint" class="hint full"></div>
+        <div id="verify-box" class="verify-box full" hidden>
+          <div id="verify-text" class="hint"></div>
+          <div class="verify-actions">
+            <a id="verify-link" class="verify-link" target="_blank" rel="noopener noreferrer">????</a>
+            <button id="verify-continue-btn" class="site-button" type="button">?????</button>
+          </div>
+        </div>
       </form>
       <div id="job-status" class="status-box">
         <div id="status-line">等待提交任务</div>
@@ -528,7 +539,9 @@ function homepageHtml(siteKey, scriptNonce = "") {
     </section>
   </main>
   <script nonce="${safeText(scriptNonce)}">
-  const STAGE_LABELS={queued:'排队中',fetching:'抓取数据',analyzing:'模型分析',rendering:'渲染页面',syncing:'同步产物',succeeded:'已完成',failed:'已失败'};
+  const STAGE_LABELS={collecting:'?????',uploading:'??????',aicu_verify_required:'?? AICU ??',queued:'???',fetching:'????',analyzing:'????',rendering:'????',syncing:'????',succeeded:'???',failed:'???'};
+  const REQUIRED_ARTIFACTS=['allVid','comment','danmu','zhibodanmu','topVideoInfos'];
+  const AICU_LIST_KEY={comment:'replies',danmu:'videodmlist',zhibodanmu:'list'};
   const statusLine=document.getElementById('status-line');
   const stageLine=document.getElementById('stage-line');
   const progressBar=document.getElementById('progress-bar');
@@ -537,12 +550,20 @@ function homepageHtml(siteKey, scriptNonce = "") {
   const sourceHint=document.getElementById('source-hint');
   const submitBtn=document.getElementById('submit-btn');
   const uidInput=document.getElementById('uid');
+  const verifyBox=document.getElementById('verify-box');
+  const verifyText=document.getElementById('verify-text');
+  const verifyLink=document.getElementById('verify-link');
+  const verifyContinueBtn=document.getElementById('verify-continue-btn');
 
-  function sleep(ms){return new Promise((r)=>setTimeout(r,ms));}
-  function setStatus(text){statusLine.textContent=text;}
+  let localWarnings=[];
+  let resumeCollectState=null;
+  let running=false;
+
+  function sleep(ms){return new Promise((r)=>setTimeout(r,Math.max(0,Number(ms)||0)));}
+  function setStatus(text){statusLine.textContent=String(text||'');}
   function setStage(stage,progress){
     const label=STAGE_LABELS[stage]||stage||'-';
-    stageLine.textContent='阶段: '+label;
+    stageLine.textContent='??: '+label;
     const safeProgress=Number.isFinite(Number(progress))?Math.max(0,Math.min(100,Number(progress))):0;
     progressBar.style.width=safeProgress+'%';
   }
@@ -555,8 +576,61 @@ function homepageHtml(siteKey, scriptNonce = "") {
       warningList.appendChild(li);
     }
   }
+  function resetWarnings(){
+    localWarnings=[];
+    renderWarnings(localWarnings);
+  }
+  function appendWarning(text){
+    if(!text) return;
+    localWarnings.push(String(text));
+    localWarnings=localWarnings.slice(-12);
+    renderWarnings(localWarnings);
+  }
+  function hideVerifyBox(){
+    verifyBox.hidden=true;
+    verifyText.textContent='';
+    verifyLink.removeAttribute('href');
+  }
+  function showVerifyBox(state,err){
+    const source=String(err.source||'aicu');
+    const page=Number(err.page||0);
+    verifyText.textContent='AICU '+source+' ? '+(page||'?')+' ?????????????????????????';
+    verifyLink.href=String(err.verifyUrl||'https://api.aicu.cc/');
+    verifyBox.hidden=false;
+    setStage('aicu_verify_required',35);
+    setStatus('????? AICU ????');
+    sourceHint.textContent='collectId='+String(state.collectId||'');
+  }
+  function ensureTurnstileToken(){
+    const token=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
+    if(!token) throw new Error('???? Turnstile ??');
+    return token;
+  }
+  function isJsonResponse(resp){
+    const ct=String(resp&&resp.headers&&resp.headers.get?resp.headers.get('content-type'):'').toLowerCase();
+    return ct.includes('application/json')||ct.includes('+json');
+  }
+  function isRetryableStatus(status){
+    const code=Number(status);
+    return code===429||code===499||code>=500;
+  }
+  function backoffMs(attempt,base,max){
+    const n=Math.max(1,Number(attempt)||1);
+    const b=Math.max(50,Number(base)||200);
+    const cap=Math.max(b,Number(max)||5000);
+    return Math.min(cap,Math.round(b*Math.pow(1.8,n-1)));
+  }
+  function createCaptchaError(source,url,page){
+    const err=new Error('AICU ??????');
+    err.type='captcha_required';
+    err.state='aicu_verify_required';
+    err.source=source;
+    err.verifyUrl=url;
+    err.page=page;
+    return err;
+  }
   function parseSingleUidInput(input){
-    const edgeSeparators=' ,，;；、|｜/\\\"\\'“”‘’()（）{}[]<>《》【】';
+    const edgeSeparators=' ,???|~!"????()??{}[]<>??????';
     const normalized=String(input??'')
       .normalize('NFKC')
       .replaceAll('\u200b','')
@@ -590,6 +664,137 @@ function homepageHtml(siteKey, scriptNonce = "") {
     if(isDigits(cleaned)&&cleaned.length<=20) return {uid:cleaned,code:'ok'};
     return {uid:null,code:'invalid_uid'};
   }
+  function isAllVidPayload(payload){
+    if(!payload||typeof payload!=='object') return false;
+    const root=(payload&&payload.data&&typeof payload.data==='object')?payload.data:payload;
+    const hasVideos=Array.isArray(root.videos);
+    const total=Number(root.total);
+    const hasTotal=Number.isFinite(total)&&total>=0;
+    return hasVideos||hasTotal;
+  }
+  function normalizeArchivePayload(payload){
+    if(payload&&payload.data&&typeof payload.data==='object'&&Array.isArray(payload.data.videos)) return payload.data;
+    return payload&&typeof payload==='object'?payload:{};
+  }
+  function isAicuPayload(source,payload){
+    if(!payload||typeof payload!=='object') return false;
+    if(Number(payload.code)!==0) return false;
+    const data=payload.data;
+    if(!data||typeof data!=='object') return false;
+    const cursor=data.cursor;
+    if(!cursor||typeof cursor!=='object') return false;
+    if(typeof cursor.is_end!=='boolean') return false;
+    if(!Number.isFinite(Number(cursor.all_count))||Number(cursor.all_count)<0) return false;
+    const key=AICU_LIST_KEY[source];
+    return Array.isArray(data[key]);
+  }
+  function isVidInfoPayload(payload){
+    if(!payload||typeof payload!=='object') return false;
+    const data=(payload&&payload.data&&typeof payload.data==='object')?payload.data:payload;
+    return Boolean(data.aid||data.bvid);
+  }
+  function buildAicuUrl(source,uid,page){
+    if(source==='comment'){
+      return 'https://api.aicu.cc/api/v3/search/getreply?uid='+encodeURIComponent(uid)+'&pn='+page+'&ps=100&mode=0';
+    }
+    if(source==='danmu'){
+      return 'https://api.aicu.cc/api/v3/search/getvideodm?uid='+encodeURIComponent(uid)+'&pn='+page+'&ps=100&keyword=';
+    }
+    return 'https://api.aicu.cc/api/v3/search/getlivedm?uid='+encodeURIComponent(uid)+'&pn='+page+'&ps=100&keyword=';
+  }
+  function pickTopVideos(videos,topN){
+    return (Array.isArray(videos)?videos:[])
+      .filter((item)=>item&&typeof item==='object')
+      .sort((a,b)=>Number(b.play_count||b.play||b?.stat?.view||0)-Number(a.play_count||a.play||a?.stat?.view||0))
+      .slice(0,topN);
+  }
+
+  async function requestUapisJson(url,options){
+    const retries=Math.max(1,Number(options&&options.retries)||5);
+    const schema=options&&typeof options.schema==='function'?options.schema:null;
+    let lastError='uapis unknown';
+    for(let attempt=1;attempt<=retries;attempt++){
+      try{
+        const resp=await fetch(url,{headers:{accept:'application/json'}});
+        if(!resp.ok){
+          if(isRetryableStatus(resp.status)&&attempt<retries){
+            await sleep(backoffMs(attempt,350,3200));
+            continue;
+          }
+          throw new Error('uapis HTTP '+resp.status);
+        }
+        if(!isJsonResponse(resp)){
+          if(attempt<retries){
+            await sleep(backoffMs(attempt,350,3200));
+            continue;
+          }
+          throw new Error('uapis ??? JSON');
+        }
+        const data=await resp.json().catch(()=>null);
+        if(!data){
+          if(attempt<retries){
+            await sleep(backoffMs(attempt,350,3200));
+            continue;
+          }
+          throw new Error('uapis JSON ????');
+        }
+        if(schema&&!schema(data)){
+          if(attempt<retries){
+            await sleep(backoffMs(attempt,350,3200));
+            continue;
+          }
+          throw new Error('uapis payload ?????');
+        }
+        return data;
+      }catch(err){
+        lastError=String(err&&err.message?err.message:err);
+        if(attempt>=retries) break;
+        await sleep(backoffMs(attempt,350,3200));
+      }
+    }
+    throw new Error(lastError);
+  }
+
+  async function requestAicuJson(source,url,page,options){
+    const retries=Math.max(1,Number(options&&options.retries)||5);
+    const schema=options&&typeof options.schema==='function'?options.schema:null;
+    let lastError='aicu unknown';
+    for(let attempt=1;attempt<=retries;attempt++){
+      try{
+        const resp=await fetch(url,{headers:{accept:'application/json'}});
+        if(!resp.ok){
+          if(isRetryableStatus(resp.status)&&attempt<retries){
+            await sleep(backoffMs(attempt,420,3600));
+            continue;
+          }
+          throw new Error('aicu HTTP '+resp.status);
+        }
+        if(!isJsonResponse(resp)){
+          throw createCaptchaError(source,url,page);
+        }
+        const data=await resp.json().catch(()=>null);
+        if(!data){
+          throw createCaptchaError(source,url,page);
+        }
+        const code=Number(data.code);
+        const retryableCode=code===-666||code===-799||code===-412;
+        if(code===0&&(!schema||schema(data))){
+          return data;
+        }
+        if((retryableCode||(schema&&!schema(data)))&&attempt<retries){
+          await sleep(backoffMs(attempt,420,3600));
+          continue;
+        }
+        throw new Error('aicu code='+code);
+      }catch(err){
+        if(err&&err.type==='captcha_required') throw err;
+        lastError=String(err&&err.message?err.message:err);
+        if(attempt>=retries) break;
+        await sleep(backoffMs(attempt,420,3600));
+      }
+    }
+    throw new Error(lastError);
+  }
 
   async function loadRecent(){
     const ul=document.getElementById('recent-list');
@@ -597,58 +802,231 @@ function homepageHtml(siteKey, scriptNonce = "") {
       const resp=await fetch('/api/recent?limit=10',{headers:{accept:'application/json'}});
       const data=await resp.json();
       const items=Array.isArray(data.items)?data.items:[];
-      ul.innerHTML=items.map((item)=>'<li><a href="/u/'+encodeURIComponent(item.uid)+'">UID '+String(item.uid)+'</a> · '+new Date(item.createdAt).toLocaleString()+'</li>').join('')||'<li>暂无数据</li>';
+      ul.innerHTML=items.map((item)=>'<li><a href="/u/'+encodeURIComponent(item.uid)+'">UID '+String(item.uid)+'</a> ? '+new Date(item.createdAt).toLocaleString()+'</li>').join('')||'<li>????</li>';
     }catch{
-      ul.innerHTML='<li>加载失败，请稍后刷新</li>';
+      ul.innerHTML='<li>??????????</li>';
     }
   }
 
-  async function fetchAllVidWithRetry(uid){
-    function isAllVidPayload(data){
-      if(!data||typeof data!=='object') return false;
-      const total=Number(data.total??data?.data?.total);
-      const hasTotal=Number.isFinite(total)&&total>=0;
-      const hasVideos=Array.isArray(data.videos)||Array.isArray(data?.data?.videos);
-      return hasTotal||hasVideos;
+  function createCollectState(uid,collectData){
+    const required=Array.isArray(collectData&&collectData.requiredArtifacts)&&collectData.requiredArtifacts.length>0?collectData.requiredArtifacts.slice():REQUIRED_ARTIFACTS.slice();
+    return {
+      uid:String(uid),
+      collectId:String(collectData&&collectData.collectId||''),
+      collectToken:String(collectData&&collectData.collectToken||''),
+      requiredArtifacts:required,
+      partSizeHint:Number(collectData&&collectData.partSizeHint||8*1024*1024),
+      checkpoints:{
+        allVid:{page:1,total:null,videos:[]},
+        comment:{page:1,total:0,items:[]},
+        danmu:{page:1,total:0,items:[]},
+        zhibodanmu:{page:1,total:0,items:[]},
+        topVideoInfos:{index:0,items:[]},
+      },
+      artifacts:{},
+    };
+  }
+
+  async function collectAllVid(state){
+    if(state.artifacts.allVid) return state.artifacts.allVid;
+    const cp=state.checkpoints.allVid||{page:1,total:null,videos:[]};
+    const pageSize=50;
+    while(cp.page<=300){
+      setStatus('???????? '+cp.page+' ?');
+      const url='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(state.uid)+'&ps='+pageSize+'&pn='+cp.page;
+      const data=await requestUapisJson(url,{retries:5,schema:isAllVidPayload});
+      const archive=normalizeArchivePayload(data);
+      const pageVideos=Array.isArray(archive.videos)?archive.videos:[];
+      const total=Number(archive.total);
+      if(Number.isFinite(total)&&total>=0) cp.total=total;
+      if(pageVideos.length===0) break;
+      cp.videos.push(...pageVideos);
+      cp.page+=1;
+      state.checkpoints.allVid=cp;
+      if(cp.total!==null&&cp.videos.length>=cp.total) break;
+      if(pageVideos.length<pageSize) break;
+      await sleep(320);
     }
-    const maxDirectAttempts=5;
-    const directTimeoutMs=5000;
-    const directUrl='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(uid)+'&ps=1&pn=1';
-    let directLastError='未知错误';
-    for(let attempt=1;attempt<=maxDirectAttempts;attempt++){
-      const controller=new AbortController();
-      const timer=setTimeout(()=>controller.abort(),directTimeoutMs);
+    state.artifacts.allVid={uid:state.uid,total:cp.total===null?cp.videos.length:cp.total,fetchedPages:Math.max(0,cp.page-1),videos:cp.videos};
+    return state.artifacts.allVid;
+  }
+
+  async function collectAicuSource(state,source,maxItems){
+    if(state.artifacts[source]) return state.artifacts[source];
+    const cp=state.checkpoints[source]||{page:1,total:0,items:[]};
+    const listKey=AICU_LIST_KEY[source];
+    while(cp.page<=500&&cp.items.length<maxItems){
+      setStatus('?? '+source+'?? '+cp.page+' ?');
+      const url=buildAicuUrl(source,state.uid,cp.page);
+      const payload=await requestAicuJson(source,url,cp.page,{retries:5,schema:(x)=>isAicuPayload(source,x)});
+      const data=payload&&payload.data&&typeof payload.data==='object'?payload.data:{};
+      const cursor=data&&data.cursor&&typeof data.cursor==='object'?data.cursor:{};
+      const pageItems=Array.isArray(data[listKey])?data[listKey]:[];
+      const allCount=Number(cursor.all_count);
+      if(Number.isFinite(allCount)&&allCount>=0) cp.total=allCount;
+      if(pageItems.length>0) cp.items.push(...pageItems);
+      const isEnd=Boolean(cursor.is_end);
+      cp.page+=1;
+      state.checkpoints[source]=cp;
+      if(isEnd||pageItems.length===0||cp.items.length>=maxItems) break;
+      await sleep(420);
+    }
+    const truncated=cp.items.length>maxItems;
+    state.artifacts[source]={uid:state.uid,source,total:cp.total||cp.items.length,fetchedPages:Math.max(0,cp.page-1),truncated,items:cp.items.slice(0,maxItems)};
+    return state.artifacts[source];
+  }
+
+  async function collectTopVideoInfos(state){
+    if(state.artifacts.topVideoInfos) return state.artifacts.topVideoInfos;
+    const allVid=await collectAllVid(state);
+    const topVideos=pickTopVideos(allVid.videos,10);
+    const cp=state.checkpoints.topVideoInfos||{index:0,items:[]};
+    while(cp.index<topVideos.length){
+      const item=topVideos[cp.index]||{};
+      const bvid=String(item.bvid||'').trim();
+      const aid=String(item.aid||'').trim();
+      if(!bvid&&!aid){
+        cp.index+=1;
+        continue;
+      }
+      setStatus('???????'+(cp.index+1)+' / '+topVideos.length);
+      const query=bvid?'bvid='+encodeURIComponent(bvid):('aid='+encodeURIComponent(aid));
       try{
-        const resp=await fetch(directUrl,{signal:controller.signal,headers:{accept:'application/json'}});
-        if(!resp.ok) throw new Error('HTTP '+resp.status);
-        const data=await resp.json();
-        if(!isAllVidPayload(data)) throw new Error('payload invalid');
-        return {via:'direct',attempt,data};
+        const payload=await requestUapisJson('https://uapis.cn/api/v1/social/bilibili/view?'+query,{retries:5,schema:isVidInfoPayload});
+        const data=(payload&&payload.data&&typeof payload.data==='object')?payload.data:payload;
+        cp.items.push({
+          bvid:String(item.bvid||data.bvid||''),
+          aid:String(item.aid||data.aid||''),
+          playCount:Number(item.play_count||item.play||data?.stat?.view||0),
+          data,
+        });
       }catch(err){
-        directLastError=String(err&&err.message?err.message:err);
-        const delay=Math.min(1800,250*(2**Math.max(0,attempt-1)));
-        await sleep(delay);
-      }finally{
-        clearTimeout(timer);
+        appendWarning('?????????????'+String(err&&err.message?err.message:err));
+      }
+      cp.index+=1;
+      state.checkpoints.topVideoInfos=cp;
+      await sleep(320);
+    }
+    state.artifacts.topVideoInfos=cp.items;
+    return state.artifacts.topVideoInfos;
+  }
+
+  async function collectRequiredArtifacts(state){
+    setStage('collecting',12);
+    await collectAllVid(state);
+    await collectAicuSource(state,'comment',1000);
+    await collectAicuSource(state,'danmu',1000);
+    await collectAicuSource(state,'zhibodanmu',500);
+    await collectTopVideoInfos(state);
+  }
+
+  async function uploadArtifact(state,artifact,payload){
+    const encoded=new TextEncoder().encode(JSON.stringify(payload||{}));
+    const initResp=await fetch('/api/upload/init',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({
+        uid:state.uid,
+        collectId:state.collectId,
+        collectToken:state.collectToken,
+        artifact,
+        size:encoded.byteLength,
+        fileName:artifact+'.json',
+        mime:'application/json',
+      }),
+    });
+    const initData=await initResp.json().catch(()=>({}));
+    if(initResp.status===409){
+      return {ok:true,collectStatus:'ready'};
+    }
+    if(!initResp.ok){
+      throw new Error(artifact+' upload init failed: '+String(initData.error||initResp.status));
+    }
+    const uploadId=String(initData.uploadId||'');
+    const uploadToken=String(initData.uploadToken||'');
+    if(!uploadId||!uploadToken){
+      throw new Error(artifact+' upload init response invalid');
+    }
+    const hint=Number(initData.maxPartSizeHint||state.partSizeHint||8*1024*1024);
+    const partSize=Math.max(256*1024,Math.min(hint,8*1024*1024));
+    const parts=[];
+    let partNumber=1;
+    for(let offset=0;offset<encoded.byteLength;offset+=partSize){
+      const chunk=encoded.slice(offset,Math.min(encoded.byteLength,offset+partSize));
+      const partResp=await fetch('/api/upload/part?uploadId='+encodeURIComponent(uploadId)+'&partNumber='+partNumber,{
+        method:'PUT',
+        headers:{'x-upload-token':uploadToken},
+        body:chunk,
+      });
+      const partData=await partResp.json().catch(()=>({}));
+      if(!partResp.ok){
+        throw new Error(artifact+' upload part failed: '+String(partData.error||partResp.status));
+      }
+      const etag=String(partData.etag||'');
+      if(!etag) throw new Error(artifact+' upload part etag missing');
+      parts.push({partNumber,etag});
+      partNumber+=1;
+      await sleep(60);
+    }
+    const completeResp=await fetch('/api/upload/complete',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({uploadId,uploadToken,parts}),
+    });
+    const completeData=await completeResp.json().catch(()=>({}));
+    if(!completeResp.ok){
+      throw new Error(artifact+' upload complete failed: '+String(completeData.error||completeResp.status));
+    }
+    return completeData;
+  }
+
+  async function uploadCollectedArtifacts(state){
+    setStage('uploading',45);
+    for(const artifact of state.requiredArtifacts){
+      if(!(artifact in state.artifacts)){
+        throw new Error('??????: '+artifact);
+      }
+      setStatus('?? '+artifact+'...');
+      const result=await uploadArtifact(state,artifact,state.artifacts[artifact]);
+      if(result&&typeof result==='object'&&result.collectStatus){
+        sourceHint.textContent='collect '+String(result.collectStatus)+' '+String(result.uploadedCount||0)+'/'+String(result.requiredCount||state.requiredArtifacts.length);
       }
     }
-    let proxyLastError='未知错误';
-    for(let proxyAttempt=1;proxyAttempt<=3;proxyAttempt++){
-      try{
-        const proxyResp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
-        const payload=await proxyResp.json().catch(()=>({}));
-        if(!proxyResp.ok){
-          const detail=Array.isArray(payload.details)&&payload.details.length?(' - '+payload.details.join(' | ')):'';
-          throw new Error('HTTP '+proxyResp.status+detail);
-        }
-        if(!isAllVidPayload(payload)) throw new Error('payload invalid');
-        return {via:'worker-proxy',attempt:maxDirectAttempts+proxyAttempt,data:payload,fallback:directLastError};
-      }catch(err){
-        proxyLastError=String(err&&err.message?err.message:err);
-        await sleep(400*proxyAttempt);
-      }
+  }
+
+  async function createCollectSession(uid){
+    const turnstileToken=ensureTurnstileToken();
+    const resp=await fetch('/api/collect/init',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({uid,turnstileToken}),
+    });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok){
+      throw new Error(String(data.error||'????????'));
     }
-    throw new Error('直连失败 '+directLastError+'；代理失败 '+proxyLastError);
+    const state=createCollectState(uid,data);
+    if(!state.collectId||!state.collectToken){
+      throw new Error('?????????');
+    }
+    return state;
+  }
+
+  async function createGenerateJob(state){
+    const turnstileToken=ensureTurnstileToken();
+    const resp=await fetch('/api/generate',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({
+        uid:state.uid,
+        collectId:state.collectId,
+        collectToken:state.collectToken,
+        turnstileToken,
+      }),
+    });
+    const data=await resp.json().catch(()=>({}));
+    if(!resp.ok) throw new Error(String(data.error||'??????'));
+    return data;
   }
 
   async function pollJob(jobId){
@@ -657,13 +1035,13 @@ function homepageHtml(siteKey, scriptNonce = "") {
       const resp=await fetch('/api/job/'+encodeURIComponent(jobId),{headers:{accept:'application/json'}});
       const job=await resp.json();
       if(!resp.ok){
-        errorLine.textContent=String(job.error||'任务状态查询失败');
+        errorLine.textContent=String(job.error||'????????');
         return;
       }
       setStage(job.stage,job.progress);
       renderWarnings(job.warnings);
       if(job.status==='succeeded'){
-        setStatus('任务完成，正在跳转页面');
+        setStatus('???????????');
         if(job.url){
           location.href=job.url;
           return;
@@ -672,48 +1050,64 @@ function homepageHtml(siteKey, scriptNonce = "") {
         return;
       }
       if(job.status==='failed'){
-        setStatus('任务失败');
-        errorLine.textContent=String(job.error||'未知错误');
+        setStatus('????');
+        errorLine.textContent=String(job.error||'????');
         return;
       }
       const waitSec=Math.max(0,Math.round((240-i)*1.5));
-      setStatus('任务进行中，预计剩余轮询 '+waitSec+' 秒');
+      setStatus('???????????? '+waitSec+' ?');
     }
-    setStatus('任务超时，请稍后重新查询');
+    setStatus('????????????');
+  }
+
+  async function runPipeline(state){
+    running=true;
+    hideVerifyBox();
+    try{
+      await collectRequiredArtifacts(state);
+      await uploadCollectedArtifacts(state);
+      setStatus('??????...');
+      const job=await createGenerateJob(state);
+      setStatus('?????????? '+String(job.estimatedWaitSec||'-')+' ?');
+      setStage(job.stage||'queued',70);
+      await pollJob(job.jobId);
+      await loadRecent();
+      resumeCollectState=null;
+    }catch(err){
+      if(err&&err.type==='captcha_required'){
+        resumeCollectState=state;
+        showVerifyBox(state,err);
+        appendWarning('AICU ???????????????????????');
+        return;
+      }
+      throw err;
+    }finally{
+      running=false;
+    }
   }
 
   async function onSubmit(event){
     event.preventDefault();
+    if(running) return;
     errorLine.textContent='';
-    renderWarnings([]);
+    resetWarnings();
     sourceHint.textContent='';
+    hideVerifyBox();
     const parsed=parseSingleUidInput(uidInput.value);
     if(!parsed.uid){
-      errorLine.textContent=parsed.code==='multi_uid'?'仅支持单 UID，请一次只输入一个 UID':'UID 格式错误，请输入 1-20 位数字';
+      errorLine.textContent=parsed.code==='multi_uid'?'???? UID????????? UID':'UID ???????? 1-20 ???';
       return;
     }
     const uid=parsed.uid;
     uidInput.value=uid;
     submitBtn.disabled=true;
     try{
-      setStatus('检查数据源连通性');
-      setStage('queued',0);
-      const source=await fetchAllVidWithRetry(uid);
-      if(source.via==='direct'){
-        sourceHint.textContent='上游直连成功（'+source.attempt+' 次尝试）。';
-      }else{
-        sourceHint.textContent='上游直连失败，已回退 Worker 代理（第 '+source.attempt+' 次成功）。';
-      }
-      const turnstileToken=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
-      const resp=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken})});
-      const data=await resp.json();
-      if(!resp.ok){
-        throw new Error(String(data.error||'任务创建失败'));
-      }
-      setStatus('任务已入队，预计等待 '+String(data.estimatedWaitSec||'-')+' 秒');
-      setStage(data.stage||'queued',0);
-      await pollJob(data.jobId);
-      await loadRecent();
+      setStage('collecting',5);
+      setStatus('??????...');
+      const state=await createCollectSession(uid);
+      resumeCollectState=state;
+      sourceHint.textContent='collectId='+state.collectId;
+      await runPipeline(state);
     }catch(err){
       errorLine.textContent=String(err&&err.message?err.message:err);
     }finally{
@@ -721,7 +1115,24 @@ function homepageHtml(siteKey, scriptNonce = "") {
     }
   }
 
+  async function onVerifyContinue(){
+    if(!resumeCollectState||running) return;
+    errorLine.textContent='';
+    verifyContinueBtn.disabled=true;
+    submitBtn.disabled=true;
+    try{
+      setStatus('?????????...');
+      await runPipeline(resumeCollectState);
+    }catch(err){
+      errorLine.textContent=String(err&&err.message?err.message:err);
+    }finally{
+      verifyContinueBtn.disabled=false;
+      submitBtn.disabled=false;
+    }
+  }
+
   document.getElementById('generate-form').addEventListener('submit',onSubmit);
+  verifyContinueBtn.addEventListener('click',onVerifyContinue);
   loadRecent();
   </script></body></html>`;
 }

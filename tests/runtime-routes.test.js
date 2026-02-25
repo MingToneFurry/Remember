@@ -205,6 +205,11 @@ test("GET / should render warning script without innerHTML injection", async () 
   assert.equal(html.includes("warningList.innerHTML"), false);
   assert.equal(html.includes("warningList.replaceChildren()"), true);
   assert.equal(html.includes("li.textContent=String(warning)"), true);
+  assert.equal(html.includes("/api/collect/init"), true);
+  assert.equal(html.includes("/api/upload/init"), true);
+  assert.equal(html.includes("aicu_verify_required"), true);
+  assert.equal(html.includes("verify-continue-btn"), true);
+  assert.equal(html.includes("createCaptchaError"), true);
   assert.equal(html.includes("输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。"), false);
   assert.equal(html.includes("remember-site-theme-v1"), true);
 });
