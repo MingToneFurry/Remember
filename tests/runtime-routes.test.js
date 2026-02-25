@@ -110,6 +110,15 @@ test("GET / should render nonce-based CSP and script nonce", async () => {
   assert.match(html, /<script nonce="[^"]+" src="https:\/\/challenges\.cloudflare\.com\/turnstile\/v0\/api\.js"/);
 });
 
+test("GET / should render warning script without innerHTML injection", async () => {
+  const env = createEnv();
+  const response = await runtime.fetch(new Request("https://rem.furry.ist/", { method: "GET" }), env, createCtx());
+  const html = await response.text();
+  assert.equal(html.includes("warningList.innerHTML"), false);
+  assert.equal(html.includes("warningList.replaceChildren()"), true);
+  assert.equal(html.includes("li.textContent=String(warning)"), true);
+});
+
 test("POST /api/generate should enqueue job and job endpoint should return stage/progress", async () => {
   const env = createEnv();
   const originalFetch = globalThis.fetch;

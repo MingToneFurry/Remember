@@ -475,7 +475,12 @@ function homepageHtml(siteKey, scriptNonce = "") {
   }
   function renderWarnings(warnings){
     const list=Array.isArray(warnings)?warnings.filter(Boolean):[];
-    warningList.innerHTML=list.map((w)=>'<li>'+String(w)+'</li>').join('');
+    warningList.replaceChildren();
+    for(const warning of list){
+      const li=document.createElement('li');
+      li.textContent=String(warning);
+      warningList.appendChild(li);
+    }
   }
 
   async function loadRecent(){
