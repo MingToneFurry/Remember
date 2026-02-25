@@ -15,6 +15,7 @@ const MAX_SITEMAP_URLS = 50000;
 const UID_COOLDOWN_SECONDS = 2 * 60 * 60;
 const ACCESS_JWKS_CACHE_TTL_MS = 10 * 60 * 1000;
 const JOB_ID_REGEX = /^job_[a-f0-9]{32}$/;
+const COLLECT_ID_REGEX = /^collect_[a-f0-9]{32}$/;
 const PUBLIC_ERROR_DETAIL_LIMIT = 5;
 const PUBLIC_ERROR_TEXT_LIMIT = 160;
 const HOT_CACHE_TTL_MS = 15 * 1000;
@@ -23,11 +24,16 @@ const UPLOAD_PART_LIMIT_PER_DAY = 2000;
 const UPLOAD_PART_LIMIT_PER_MINUTE = 120;
 const UPLOAD_COMPLETE_LIMIT_PER_DAY = 200;
 const UPLOAD_COMPLETE_LIMIT_PER_MINUTE = 20;
+const COLLECT_INIT_LIMIT_PER_DAY = 20;
+const COLLECT_INIT_LIMIT_PER_MINUTE = 6;
+const COLLECT_SESSION_TTL_SECONDS = 24 * 3600;
+const COLLECT_TOKEN_TTL_SECONDS = 45 * 60;
 const UID_REGEX = /^\d{1,20}$/;
 const UID_SEGMENT_REGEX = /^\d+$/;
 const UID_ZERO_WIDTH_REGEX = /[\u200b-\u200d\u2060\ufeff]/g;
 const UID_EDGE_SEPARATOR_REGEX = /^[\s,，;；、|｜/\\`"'“”‘’()（）[\]{}<>《》【】]+|[\s,，;；、|｜/\\`"'“”‘’()（）[\]{}<>《》【】]+$/g;
 const UID_SPLIT_SEPARATOR_REGEX = /[,\s，;；、|｜/\\]+/;
+const COLLECT_REQUIRED_ARTIFACTS = Object.freeze(["allVid", "comment", "danmu", "zhibodanmu", "topVideoInfos"]);
 const upstreamClient = createDefaultUpstreamClient(fetch);
 const hotCache = {
   recent: { expiresAt: 0, items: [] },
@@ -144,6 +150,11 @@ function safeText(value) {
 function normalizeJobId(input) {
   const raw = String(input || "").trim();
   return JOB_ID_REGEX.test(raw) ? raw : null;
+}
+
+function normalizeCollectId(input) {
+  const raw = String(input || "").trim();
+  return COLLECT_ID_REGEX.test(raw) ? raw : null;
 }
 
 function sanitizePublicDetails(details) {
@@ -1055,6 +1066,43 @@ async function handleProxy(request, env, url, requestId = "unknown") {
   return jsonResponse(payload, 200, { "cache-control": "no-store" });
 }
 
+async function handleCollectInit(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const uid = parseSingleUidOrThrow(body.uid);
+  await verifyTurnstile(request, env, body.turnstileToken);
+  await enforceIpRateLimit(env, request, "collect-init", COLLECT_INIT_LIMIT_PER_DAY, COLLECT_INIT_LIMIT_PER_MINUTE);
+
+  const collectId = randomId("collect");
+  const now = Date.now();
+  const expiresAt = now + COLLECT_SESSION_TTL_SECONDS * 1000;
+  const session = {
+    uid,
+    collectId,
+    status: "collecting",
+    requiredArtifacts: [...COLLECT_REQUIRED_ARTIFACTS],
+    uploadedArtifacts: {},
+    totalBytes: 0,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt,
+  };
+  const collectToken = await issueSignedToken(env, { uid, collectId, scope: "collect" }, COLLECT_TOKEN_TTL_SECONDS);
+  await env.REMEMBER_KV.put(`collect:${collectId}`, JSON.stringify(session), { expirationTtl: COLLECT_SESSION_TTL_SECONDS });
+  return jsonResponse(
+    {
+      ok: true,
+      uid,
+      collectId,
+      collectToken,
+      requiredArtifacts: [...COLLECT_REQUIRED_ARTIFACTS],
+      expiresAt,
+      partSizeHint: PART_SIZE_HINT,
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
+}
+
 async function handleUploadInit(request, env) {
   const body = await request.json().catch(() => ({}));
   const uid = parseSingleUidOrThrow(body.uid);
@@ -1424,6 +1472,7 @@ async function handleFetch(request, env, ctx) {
       return jsonResponse({ items: await getRecent(env, limit) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
     }
     if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url, requestId), cors);
+    if (request.method === "POST" && path === "/api/collect/init") return applyCorsToResponse(await handleCollectInit(request, env), cors);
     if (request.method === "POST" && path === "/api/upload/init") return applyCorsToResponse(await handleUploadInit(request, env), cors);
     if (request.method === "PUT" && path === "/api/upload/part") return applyCorsToResponse(await handleUploadPart(request, env, url), cors);
     if (request.method === "POST" && path === "/api/upload/complete") return applyCorsToResponse(await handleUploadComplete(request, env), cors);
@@ -1561,5 +1610,3 @@ export default {
     ctx.waitUntil(handleQueue(batch, env));
   },
 };
-
-
