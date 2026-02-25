@@ -539,13 +539,38 @@ function homepageHtml(siteKey, scriptNonce = "") {
     }
   }
   function parseSingleUidInput(input){
-    const normalized=String(input??'').normalize('NFKC').replace(/[\u200b-\u200d\u2060\ufeff]/g,'').trim();
-    const cleaned=normalized.replace(/^[\s,，;；、|｜/\\"'“”‘’()（）[\]{}<>《》【】]+|[\s,，;；、|｜/\\"'“”‘’()（）[\]{}<>《》【】]+$/g,'');
+    const edgeSeparators=' ,，;；、|｜/\\\"\\'“”‘’()（）{}[]<>《》【】';
+    const normalized=String(input??'')
+      .normalize('NFKC')
+      .replaceAll('\u200b','')
+      .replaceAll('\u200c','')
+      .replaceAll('\u200d','')
+      .replaceAll('\u2060','')
+      .replaceAll('\ufeff','')
+      .trim();
+    let start=0;
+    let end=normalized.length;
+    while(start<end&&edgeSeparators.includes(normalized[start])) start+=1;
+    while(end>start&&edgeSeparators.includes(normalized[end-1])) end-=1;
+    const cleaned=normalized.slice(start,end);
     if(!cleaned) return {uid:null,code:'invalid_uid'};
-    const segments=cleaned.split(/[,\s，;；、|｜/\\]+/).filter(Boolean);
-    const numericSegments=segments.filter((segment)=>/^\d+$/.test(segment));
+    const segments=[];
+    let current='';
+    for(const ch of cleaned){
+      if(edgeSeparators.includes(ch)){
+        if(current){
+          segments.push(current);
+          current='';
+        }
+      }else{
+        current+=ch;
+      }
+    }
+    if(current) segments.push(current);
+    const isDigits=(value)=>/^[0-9]+$/.test(value);
+    const numericSegments=segments.filter((segment)=>isDigits(segment));
     if(numericSegments.length>1) return {uid:null,code:'multi_uid'};
-    if(/^\d{1,20}$/.test(cleaned)) return {uid:cleaned,code:'ok'};
+    if(isDigits(cleaned)&&cleaned.length<=20) return {uid:cleaned,code:'ok'};
     return {uid:null,code:'invalid_uid'};
   }
 
