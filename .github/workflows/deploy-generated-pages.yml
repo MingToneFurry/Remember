@@ -32,6 +32,11 @@ jobs:
             npm install
           fi
 
+      - name: Run quality gates
+        run: |
+          npm run check
+          npm run test
+
       - name: Deploy worker to Cloudflare
         run: npx wrangler deploy --env production
         env:
