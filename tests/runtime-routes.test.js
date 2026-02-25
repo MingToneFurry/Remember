@@ -99,6 +99,52 @@ function createAsyncCtx() {
   };
 }
 
+function createMemoryR2(initialObjects = {}) {
+  const store = new Map();
+  for (const [key, value] of Object.entries(initialObjects)) {
+    store.set(key, {
+      body: typeof value === "string" ? value : JSON.stringify(value),
+      uploaded: new Date(),
+    });
+  }
+  return {
+    __store: store,
+    async get(key) {
+      const item = store.get(key);
+      if (!item) return null;
+      return {
+        uploaded: item.uploaded,
+        async text() {
+          return item.body;
+        },
+      };
+    },
+    async put(key, value) {
+      store.set(key, {
+        body: typeof value === "string" ? value : String(value),
+        uploaded: new Date(),
+      });
+    },
+    async delete(key) {
+      store.delete(key);
+    },
+    async list(options = {}) {
+      const prefix = String(options.prefix || "");
+      const cursor = Number(options.cursor || 0);
+      const limit = Number(options.limit || 1000);
+      const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+      const slice = keys.slice(cursor, cursor + limit);
+      const next = cursor + slice.length;
+      const truncated = next < keys.length;
+      return {
+        objects: slice.map((key) => ({ key, uploaded: store.get(key)?.uploaded || new Date() })),
+        truncated,
+        cursor: truncated ? String(next) : undefined,
+      };
+    },
+  };
+}
+
 async function createReadyCollectSession(env, uid, turnstileToken = "ok-token") {
   const collectResp = await runtime.fetch(
     new Request("https://rem.furry.ist/api/collect/init", {
@@ -530,6 +576,207 @@ test("queue should retry when attempts are below max", async () => {
 
   assert.equal(ackCount, 0);
   assert.equal(retryCount, 1);
+});
+
+test("queue should fail job when required artifact is missing", async () => {
+  const uid = "123456";
+  const collectId = "collect_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const jobId = "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const env = createEnv({
+    REMEMBER_DATA: createMemoryR2(),
+  });
+  await env.REMEMBER_KV.put(
+    `job:${jobId}`,
+    JSON.stringify({
+      jobId,
+      uid,
+      collectId,
+      status: "queued",
+      stage: "queued",
+      warnings: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+  await env.REMEMBER_KV.put(
+    `collect:${collectId}`,
+    JSON.stringify({
+      uid,
+      collectId,
+      status: "ready",
+      requiredArtifacts: ["allVid", "comment", "danmu", "zhibodanmu", "topVideoInfos"],
+      uploadedArtifacts: {
+        allVid: { artifact: "allVid", key: "raw/mock/123456/allVid.json", size: 100 },
+      },
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 24 * 3600 * 1000,
+    }),
+  );
+
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: JSON.stringify({ jobId, uid, collectId }),
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  const job = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+  assert.equal(job.status, "failed");
+  assert.match(String(job.error || ""), /采集产物不完整/);
+  assert.equal(ackCount, 1);
+  assert.equal(retryCount, 0);
+});
+
+test("queue should build page from uploaded artifacts when collect data is complete", async () => {
+  const uid = "654321";
+  const collectId = "collect_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const jobId = "job_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const requiredArtifacts = ["allVid", "comment", "danmu", "zhibodanmu", "topVideoInfos"];
+  const uploadedArtifacts = {
+    allVid: {
+      artifact: "allVid",
+      key: "raw/mock/654321/allVid.json",
+      fileName: "allVid.json",
+      mime: "application/json",
+      size: 120,
+      uploadedAt: Date.now(),
+    },
+    comment: {
+      artifact: "comment",
+      key: "raw/mock/654321/comment.json",
+      fileName: "comment.json",
+      mime: "application/json",
+      size: 120,
+      uploadedAt: Date.now(),
+    },
+    danmu: {
+      artifact: "danmu",
+      key: "raw/mock/654321/danmu.json",
+      fileName: "danmu.json",
+      mime: "application/json",
+      size: 120,
+      uploadedAt: Date.now(),
+    },
+    zhibodanmu: {
+      artifact: "zhibodanmu",
+      key: "raw/mock/654321/zhibodanmu.json",
+      fileName: "zhibodanmu.json",
+      mime: "application/json",
+      size: 120,
+      uploadedAt: Date.now(),
+    },
+    topVideoInfos: {
+      artifact: "topVideoInfos",
+      key: "raw/mock/654321/topVideoInfos.json",
+      fileName: "topVideoInfos.json",
+      mime: "application/json",
+      size: 120,
+      uploadedAt: Date.now(),
+    },
+  };
+  const memoryR2 = createMemoryR2({
+    [uploadedArtifacts.allVid.key]: {
+      uid,
+      total: 1,
+      fetchedPages: 1,
+      videos: [{ bvid: "BV1xx411c7Q1", aid: "111", title: "video-title", play_count: 99 }],
+    },
+    [uploadedArtifacts.comment.key]: {
+      uid,
+      source: "comment",
+      total: 1,
+      fetchedPages: 1,
+      items: [{ message: "comment-text" }],
+    },
+    [uploadedArtifacts.danmu.key]: {
+      uid,
+      source: "danmu",
+      total: 1,
+      fetchedPages: 1,
+      items: [{ content: "danmu-text" }],
+    },
+    [uploadedArtifacts.zhibodanmu.key]: {
+      uid,
+      source: "zhibodanmu",
+      total: 1,
+      fetchedPages: 1,
+      items: [{ danmu: [{ uname: "live-user", text: "live-danmu" }] }],
+    },
+    [uploadedArtifacts.topVideoInfos.key]: [
+      {
+        bvid: "BV1xx411c7Q1",
+        aid: "111",
+        playCount: 99,
+        data: {
+          title: "video-title",
+          bvid: "BV1xx411c7Q1",
+          aid: "111",
+          stat: { view: 99 },
+        },
+      },
+    ],
+  });
+  const env = createEnv({
+    REMEMBER_DATA: memoryR2,
+  });
+  await env.REMEMBER_KV.put(
+    `job:${jobId}`,
+    JSON.stringify({
+      jobId,
+      uid,
+      collectId,
+      status: "queued",
+      stage: "queued",
+      warnings: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+  await env.REMEMBER_KV.put(
+    `collect:${collectId}`,
+    JSON.stringify({
+      uid,
+      collectId,
+      status: "ready",
+      requiredArtifacts,
+      uploadedArtifacts,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      expiresAt: Date.now() + 24 * 3600 * 1000,
+    }),
+  );
+
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: JSON.stringify({ jobId, uid, collectId }),
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  const job = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+  assert.equal(job.status, "succeeded");
+  assert.equal(job.url, `/u/${uid}`);
+  assert.equal(memoryR2.__store.has(`pages/${uid}.html`), true);
+  assert.equal(memoryR2.__store.has(`snapshots/${uid}/${jobId}.json`), true);
+  assert.equal(ackCount, 1);
+  assert.equal(retryCount, 0);
 });
 
 test("queue should ack running jobs without reprocessing", async () => {

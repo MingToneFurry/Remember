@@ -1,7 +1,7 @@
 import { createDefaultUpstreamClient } from "../services/upstreamClient.js";
 import { analyzeWithGrok } from "../services/grokAnalyzer.js";
 import { syncGeneratedPageToGitHub } from "../services/githubSync.js";
-import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData, fetchTopVideoInfosByPlayCount } from "../services/memorialData.js";
+import { buildSnapshotFromArtifacts, estimateRegDateByUid } from "../services/memorialData.js";
 import { buildMemorialPage } from "../templates/memorialTemplate.js";
 import { buildSiteThemeCss } from "../templates/siteTheme.js";
 
@@ -206,10 +206,6 @@ function sanitizeFailureMessage(input) {
     .replace(/(token|secret|authorization)\s*[:=]\s*([^\s,;]+)/gi, "$1=[REDACTED]")
     .replace(/[A-Za-z0-9_-]{24,}/g, "[REDACTED]")
     .slice(0, 220);
-}
-
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
 function randomId(prefix = "id") {
@@ -780,6 +776,41 @@ function buildPage(uid, snapshot) {
   return buildMemorialPage(uid, snapshot, safeText);
 }
 
+function normalizeUploadedArtifactMeta(value) {
+  if (!value || typeof value !== "object") return null;
+  const key = String(value.key || "").trim();
+  if (!key) return null;
+  return {
+    artifact: String(value.artifact || "").trim(),
+    key,
+    fileName: String(value.fileName || "").trim(),
+    mime: String(value.mime || "").trim(),
+    size: Number(value.size || 0),
+    uploadId: String(value.uploadId || "").trim(),
+    uploadedAt: Number(value.uploadedAt || 0),
+  };
+}
+
+async function readUploadedArtifactJson(env, collectId, artifact, meta) {
+  const normalizedMeta = normalizeUploadedArtifactMeta(meta);
+  if (!normalizedMeta) {
+    throw new Error(`artifact ${artifact} metadata invalid (collectId=${collectId})`);
+  }
+  const obj = await env.REMEMBER_DATA.get(normalizedMeta.key);
+  if (!obj || typeof obj.text !== "function") {
+    throw new Error(`artifact ${artifact} missing in R2 (collectId=${collectId})`);
+  }
+  const text = await obj.text();
+  if (!text || !String(text).trim()) {
+    throw new Error(`artifact ${artifact} payload empty (collectId=${collectId})`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`artifact ${artifact} payload is not valid JSON (collectId=${collectId})`);
+  }
+}
+
 async function processGenerateJob(env, jobId) {
   const jobKey = `job:${jobId}`;
   const current = await env.REMEMBER_KV.get(jobKey, "json");
@@ -802,93 +833,82 @@ async function processGenerateJob(env, jobId) {
 
   await patchJob({ status: "running", stage: "fetching", progress: 10 });
   try {
-    const safeFetch = async (task, fallbackValue, label, options = {}) => {
-      const attempts = Math.max(1, Number(options.attempts) || 1);
-      const retryDelayMs = Math.max(100, Number(options.retryDelayMs) || 800);
-      let lastReason = "unknown";
-      for (let attempt = 1; attempt <= attempts; attempt += 1) {
-        try {
-          const value = await task();
-          if (attempt > 1) {
-            console.log("job_data_source_recovered", { jobId, uid, label, attempt });
-          }
-          return { value, warning: null };
-        } catch (err) {
-          lastReason = sanitizeFailureMessage(err?.message || err);
-          if (attempt < attempts) {
-            console.warn("job_data_source_retry", { jobId, uid, label, attempt, reason: lastReason });
-            await sleepMs(retryDelayMs * attempt);
-          }
-        }
-      }
-      console.warn("job_data_source_degraded", { jobId, uid, label, reason: lastReason, attempts });
-      return { value: fallbackValue, warning: `${label}抓取失败，已降级：${lastReason}` };
-    };
-    const [uploadsRaw, allVidResult, commentsResult, danmuResult, liveDanmuResult] = await Promise.all([
-      env.REMEMBER_KV.get(`uploads:index:${uid}`, "json"),
-      safeFetch(
-        () => fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 }),
-        { uid, total: 0, fetchedPages: 0, videos: [] },
-        "视频列表",
-        { attempts: 2, retryDelayMs: 1200 },
-      ),
-      safeFetch(
-        () => fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 }),
-        { uid, source: "comment", total: 0, fetchedPages: 0, truncated: false, items: [] },
-        "评论",
-        { attempts: 2, retryDelayMs: 1200 },
-      ),
-      safeFetch(
-        () => fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 }),
-        { uid, source: "danmu", total: 0, fetchedPages: 0, truncated: false, items: [] },
-        "弹幕",
-        { attempts: 2, retryDelayMs: 1200 },
-      ),
-      safeFetch(
-        () => fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 }),
-        { uid, source: "zhibodanmu", total: 0, fetchedPages: 0, truncated: false, items: [] },
-        "直播弹幕",
-        { attempts: 2, retryDelayMs: 1200 },
-      ),
-    ]);
-    const allVid = allVidResult.value;
-    const comments = commentsResult.value;
-    const danmu = danmuResult.value;
-    const liveDanmu = liveDanmuResult.value;
-    const topVideoInfosResult = await safeFetch(
-      () => fetchTopVideoInfosByPlayCount(upstreamClient, allVid.videos || [], { topN: 10, concurrency: 3 }),
-      [],
-      "视频详情",
-    );
-    const uploads = Array.isArray(uploadsRaw) ? uploadsRaw : [];
-    const topVideoInfos = topVideoInfosResult.value;
-    const regDateEstimate = estimateRegDateByUid(uid);
-    const dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
-    const generatedAt = Date.now();
-    const warnings = [allVidResult.warning, commentsResult.warning, danmuResult.warning, liveDanmuResult.warning, topVideoInfosResult.warning].filter(Boolean);
-    const hasAnyData =
-      Number(allVid?.total || 0) > 0 ||
-      Number(comments?.total || 0) > 0 ||
-      Number(danmu?.total || 0) > 0 ||
-      Number(liveDanmu?.total || 0) > 0;
-    if (!hasAnyData && warnings.length > 0) {
+    const collectId = normalizeCollectId(current.collectId);
+    if (!collectId) {
       await patchJob({
         status: "failed",
         stage: "failed",
-        error: "上游接口暂不可用，未获取到有效数据，请稍后重试",
-        warnings,
+        error: "collectId 不合法",
+        warnings: ["采集会话标识缺失，无法读取已上传数据"],
       });
       return;
     }
 
+    const collectSession = await env.REMEMBER_KV.get(`collect:${collectId}`, "json");
+    if (!collectSession || collectSession.uid !== uid) {
+      await patchJob({
+        status: "failed",
+        stage: "failed",
+        error: "采集会话无效",
+        warnings: [`collectId=${collectId}`],
+      });
+      return;
+    }
+
+    const requiredArtifacts = Array.isArray(collectSession.requiredArtifacts) && collectSession.requiredArtifacts.length > 0
+      ? collectSession.requiredArtifacts
+      : [...COLLECT_REQUIRED_ARTIFACTS];
+    const uploadedArtifacts = collectSession.uploadedArtifacts && typeof collectSession.uploadedArtifacts === "object"
+      ? collectSession.uploadedArtifacts
+      : {};
+    const missingArtifacts = requiredArtifacts.filter((artifact) => !normalizeUploadedArtifactMeta(uploadedArtifacts[artifact]));
+    if (missingArtifacts.length > 0) {
+      await patchJob({
+        status: "failed",
+        stage: "failed",
+        error: "采集产物不完整，无法生成",
+        warnings: [`缺失 artifacts: ${missingArtifacts.join(", ")}`],
+      });
+      return;
+    }
+
+    await patchJob({ stage: "fetching", progress: 35 });
+    const artifactPayloads = {};
+    const warnings = [];
+    for (const artifact of requiredArtifacts) {
+      try {
+        artifactPayloads[artifact] = await readUploadedArtifactJson(env, collectId, artifact, uploadedArtifacts[artifact]);
+      } catch (err) {
+        warnings.push(sanitizeFailureMessage(err?.message || err));
+      }
+    }
+    if (warnings.length > 0) {
+      await patchJob({
+        status: "failed",
+        stage: "failed",
+        error: "采集产物读取失败，无法生成",
+        warnings: warnings.slice(0, 8),
+      });
+      return;
+    }
+
+    const { allVid, comments, danmu, liveDanmu, topVideoInfos } = buildSnapshotFromArtifacts(uid, artifactPayloads);
+    const uploads = requiredArtifacts
+      .map((artifact) => normalizeUploadedArtifactMeta(uploadedArtifacts[artifact]))
+      .filter(Boolean);
+    const regDateEstimate = estimateRegDateByUid(uid);
+    const dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
+    const generatedAt = Date.now();
+
     await patchJob({ stage: "analyzing", progress: 60, warnings });
     const snapshotBase = {
       uid,
+      collectId,
       uploads,
       createdAt: generatedAt,
       generatedAt,
       dataNotice,
-      sourceQuality: "third-party-unstable",
+      sourceQuality: "browser-uploaded",
       allVid,
       topVideoInfos,
       comments,

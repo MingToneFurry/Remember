@@ -289,3 +289,115 @@ export async function fetchTopVideoInfosByPlayCount(client, videos, options = {}
 
   return infos.filter(Boolean);
 }
+
+function pickPayloadData(payload) {
+  if (!isRecord(payload)) return {};
+  if (isRecord(payload.data)) return payload.data;
+  return payload;
+}
+
+function toBvid(value) {
+  const bvid = String(value || "").trim();
+  return /^BV[0-9A-Za-z]{10}$/.test(bvid) ? bvid : "";
+}
+
+function toAid(value) {
+  const aid = String(value || "").trim();
+  return /^\d+$/.test(aid) ? aid : "";
+}
+
+function normalizeAllVidArtifact(uid, payload) {
+  const data = pickPayloadData(payload);
+  const videos = toSafeArray(data.videos);
+  const total = toNonNegativeIntOrNull(data.total) ?? toNonNegativeIntOrNull(payload?.total) ?? videos.length;
+  const fetchedPages =
+    toNonNegativeIntOrNull(data.fetchedPages) ??
+    toNonNegativeIntOrNull(payload?.fetchedPages) ??
+    toNonNegativeIntOrNull(data.page) ??
+    toNonNegativeIntOrNull(payload?.page) ??
+    (videos.length > 0 ? 1 : 0);
+  return {
+    uid: String(uid),
+    total,
+    fetchedPages,
+    videos,
+  };
+}
+
+function normalizeAicuArtifact(source, uid, payload) {
+  const data = pickPayloadData(payload);
+  const listKey = AICU_LIST_KEY_BY_SOURCE[source];
+  const listFromSource = toSafeArray(data[listKey]);
+  const items = listFromSource.length > 0 ? listFromSource : toSafeArray(payload?.items);
+  const cursor = isRecord(data.cursor) ? data.cursor : isRecord(payload?.cursor) ? payload.cursor : {};
+  const total =
+    toNonNegativeIntOrNull(cursor.all_count) ??
+    toNonNegativeIntOrNull(payload?.total) ??
+    toNonNegativeIntOrNull(data.total) ??
+    items.length;
+  const fetchedPages =
+    toNonNegativeIntOrNull(payload?.fetchedPages) ??
+    toNonNegativeIntOrNull(data.fetchedPages) ??
+    toNonNegativeIntOrNull(payload?.page) ??
+    toNonNegativeIntOrNull(data.page) ??
+    (items.length > 0 ? 1 : 0);
+  return {
+    uid: String(uid),
+    source,
+    total,
+    fetchedPages,
+    truncated: Boolean(payload?.truncated),
+    items,
+  };
+}
+
+function deriveTopVideoInfosFromAllVid(videos) {
+  return toSafeArray(videos)
+    .filter((item) => isRecord(item))
+    .sort((a, b) => toNumber(b.play_count ?? b.play ?? b?.stat?.view) - toNumber(a.play_count ?? a.play ?? a?.stat?.view))
+    .slice(0, 10)
+    .map((item) => ({
+      bvid: toBvid(item.bvid),
+      aid: toAid(item.aid),
+      playCount: toNumber(item.play_count ?? item.play ?? item?.stat?.view),
+      data: item,
+    }));
+}
+
+function normalizeTopVideoInfosArtifact(payload, allVidVideos) {
+  let items = [];
+  if (Array.isArray(payload)) {
+    items = payload;
+  } else if (Array.isArray(payload?.items)) {
+    items = payload.items;
+  } else if (Array.isArray(payload?.topVideoInfos)) {
+    items = payload.topVideoInfos;
+  }
+
+  const normalized = toSafeArray(items)
+    .filter((item) => isRecord(item))
+    .map((item) => {
+      const data = isRecord(item.data) ? item.data : item;
+      const bvid = toBvid(item.bvid || data?.bvid);
+      const aid = toAid(item.aid || data?.aid);
+      return {
+        ...item,
+        bvid,
+        aid,
+        playCount: toNumber(item.playCount ?? item.play_count ?? data?.stat?.view),
+        data,
+      };
+    })
+    .filter((item) => item.bvid || item.aid || isRecord(item.data));
+  if (normalized.length > 0) return normalized.slice(0, 20);
+  return deriveTopVideoInfosFromAllVid(allVidVideos);
+}
+
+export function buildSnapshotFromArtifacts(uid, artifacts = {}) {
+  const allVid = normalizeAllVidArtifact(uid, artifacts.allVid);
+  const comments = normalizeAicuArtifact("comment", uid, artifacts.comment);
+  const danmu = normalizeAicuArtifact("danmu", uid, artifacts.danmu);
+  const liveDanmu = normalizeAicuArtifact("zhibodanmu", uid, artifacts.zhibodanmu);
+  const topVideoInfos = normalizeTopVideoInfosArtifact(artifacts.topVideoInfos, allVid.videos);
+  return { allVid, comments, danmu, liveDanmu, topVideoInfos };
+}
