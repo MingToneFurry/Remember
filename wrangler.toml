@@ -1,4 +1,4 @@
-name = "remember-pages"
+name = "remember-pages-production"
 main = "workers.js"
 compatibility_date = "2026-01-15"
 workers_dev = true
