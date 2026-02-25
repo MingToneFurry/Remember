@@ -3,6 +3,21 @@ main = "workers.js"
 compatibility_date = "2026-01-15"
 workers_dev = true
 
+[observability]
+enabled = false
+head_sampling_rate = 1
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
+
+[observability.traces]
+enabled = true
+persist = true
+head_sampling_rate = 1
+
 [vars]
 TURNSTILE_SITE_KEY = "0x4AAAAAAB4QPl_JmbOFAf6Z"
 ACCESS_AUD = "a19fcd53a38c408af9e08759d726fe4e2d334f93aed63040c3d3fa40a040ec9b"

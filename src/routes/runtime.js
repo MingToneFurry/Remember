@@ -83,11 +83,12 @@ function jsonResponse(data, status = 200, headers = {}) {
 function htmlResponse(html, status = 200, headers = {}, options = {}) {
   const nonce = String(options.nonce || "").trim();
   const scriptSrc = nonce ? `'self' 'nonce-${nonce}' https://challenges.cloudflare.com` : "'self' https://challenges.cloudflare.com";
+  const connectSrc = "'self' https://uapis.cn https://api.aicu.cc https://challenges.cloudflare.com";
   const h = securityHeaders(headers);
   h.set("content-type", "text/html; charset=utf-8");
   h.set(
     "content-security-policy",
-    `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';`,
+    `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ${connectSrc}; frame-src https://challenges.cloudflare.com; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';`,
   );
   return new Response(html, { status, headers: h });
 }
@@ -774,6 +775,7 @@ async function processGenerateJob(env, jobId) {
         return { value: await task(), warning: null };
       } catch (err) {
         const reason = sanitizeFailureMessage(err?.message || err);
+        console.warn("job_data_source_degraded", { jobId, uid, label, reason });
         return { value: fallbackValue, warning: `${label}抓取失败，已降级：${reason}` };
       }
     };
@@ -905,7 +907,7 @@ function proxyRetryOptions(source) {
   };
 }
 
-async function handleProxy(request, env, url) {
+async function handleProxy(request, env, url, requestId = "unknown") {
   await enforceIpRateLimit(env, request, "proxy", 120, 30);
   const source = url.pathname.split("/").pop();
   const rawUid = url.searchParams.get("uid");
@@ -944,13 +946,28 @@ async function handleProxy(request, env, url) {
 
   let payload;
   try {
+    console.log("proxy_upstream_start", { requestId, source, upstream });
     const { data } = await upstreamClient.requestJson(upstream, {
       ...proxyRetryOptions(source),
       schema: (data) => proxySchemaValidator(source, data),
     });
     payload = data;
   } catch (err) {
-    throw new HttpError(502, "上游接口请求失败");
+    const status = Number(err?.details?.status);
+    const reason = sanitizeFailureMessage(err?.message || err);
+    console.error("proxy_upstream_failed", {
+      requestId,
+      source,
+      upstream,
+      upstreamStatus: Number.isFinite(status) ? status : null,
+      reason,
+    });
+    throw new HttpError(502, "上游接口请求失败", [
+      `source=${source}`,
+      Number.isFinite(status) ? `upstreamStatus=${status}` : "upstreamStatus=unknown",
+      `reason=${reason}`,
+      `requestId=${requestId}`,
+    ]);
   }
 
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
@@ -1327,7 +1344,7 @@ async function handleFetch(request, env, ctx) {
       const limit = parseBoundedInt(url.searchParams.get("limit"), 1, MAX_RECENT, MAX_RECENT);
       return jsonResponse({ items: await getRecent(env, limit) }, 200, { ...cors, "cache-control": "public, s-maxage=60" });
     }
-    if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url), cors);
+    if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url, requestId), cors);
     if (request.method === "POST" && path === "/api/upload/init") return applyCorsToResponse(await handleUploadInit(request, env), cors);
     if (request.method === "PUT" && path === "/api/upload/part") return applyCorsToResponse(await handleUploadPart(request, env, url), cors);
     if (request.method === "POST" && path === "/api/upload/complete") return applyCorsToResponse(await handleUploadComplete(request, env), cors);
