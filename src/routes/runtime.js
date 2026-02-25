@@ -26,6 +26,8 @@ const UPLOAD_COMPLETE_LIMIT_PER_DAY = 200;
 const UPLOAD_COMPLETE_LIMIT_PER_MINUTE = 20;
 const COLLECT_INIT_LIMIT_PER_DAY = 20;
 const COLLECT_INIT_LIMIT_PER_MINUTE = 6;
+const COLLECT_AICU_LIMIT_PER_DAY = 2400;
+const COLLECT_AICU_LIMIT_PER_MINUTE = 240;
 const COLLECT_SESSION_TTL_SECONDS = 24 * 3600;
 const COLLECT_TOKEN_TTL_SECONDS = 45 * 60;
 const UID_REGEX = /^\d{1,20}$/;
@@ -255,6 +257,27 @@ function parseBoundedInt(input, min, max, fallback) {
   const value = Number(raw);
   if (!Number.isSafeInteger(value)) return fallback;
   return Math.max(min, Math.min(max, value));
+}
+
+function sleepFor(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function computeBackoffMs(attempt, baseMs = 300, maxMs = 4000) {
+  const n = Math.max(1, Number(attempt) || 1);
+  const base = Math.max(50, Number(baseMs) || 300);
+  const cap = Math.max(base, Number(maxMs) || 4000);
+  return Math.min(cap, Math.round(base * (1.8 ** (n - 1))));
+}
+
+function isRetryableUpstreamStatus(status) {
+  const code = Number(status);
+  return code === 429 || code === 499 || code >= 500;
+}
+
+function isJsonContentType(contentType) {
+  const ct = String(contentType || "").toLowerCase();
+  return ct.includes("application/json") || ct.includes("+json");
 }
 
 function timingSafeEqual(a, b) {
@@ -755,50 +778,59 @@ function homepageHtml(siteKey, scriptNonce = "") {
     throw new Error(lastError);
   }
 
-  async function requestAicuJson(source,url,page,options){
-    const retries=Math.max(1,Number(options&&options.retries)||5);
+  async function requestAicuJson(state,source,page,options){
+    const retries=Math.max(1,Number(options&&options.retries)||2);
     const schema=options&&typeof options.schema==='function'?options.schema:null;
+    const keyword=String(options&&options.keyword||'');
     let lastError='aicu unknown';
     for(let attempt=1;attempt<=retries;attempt++){
       try{
-        const resp=await fetch(url,{headers:{accept:'application/json'}});
-        const status=Number(resp.status||0);
-        const challengeStatus=status===468||status===412||status===403;
-        if(challengeStatus){
-          throw createCaptchaError(source,url,page);
+        const resp=await fetch('/api/collect/aicu',{
+          method:'POST',
+          headers:{'content-type':'application/json',accept:'application/json'},
+          body:JSON.stringify({
+            uid:state.uid,
+            collectId:state.collectId,
+            collectToken:state.collectToken,
+            source,
+            page,
+            keyword,
+          }),
+        });
+        const payload=await resp.json().catch(()=>null);
+        if(resp.status===409&&payload&&payload.code==='aicu_verify_required'){
+          const verifyUrl=String(payload.verifyUrl||buildAicuUrl(source,state.uid,page));
+          throw createCaptchaError(source,verifyUrl,page);
         }
         if(!resp.ok){
-          if(!isJsonResponse(resp)){
-            throw createCaptchaError(source,url,page);
-          }
+          const status=Number(resp.status||0);
           if(isRetryableStatus(status)&&attempt<retries){
-            await sleep(backoffMs(attempt,420,3600));
+            await sleep(backoffMs(attempt,520,5200));
             continue;
           }
-          throw new Error('aicu HTTP '+status);
+          const msg=payload&&payload.error?String(payload.error):('aicu relay HTTP '+status);
+          throw new Error(msg);
         }
-        if(!isJsonResponse(resp)){
-          throw createCaptchaError(source,url,page);
+        if(!payload||typeof payload!=='object'){
+          if(attempt<retries){
+            await sleep(backoffMs(attempt,520,5200));
+            continue;
+          }
+          throw new Error('aicu relay payload invalid');
         }
-        const data=await resp.json().catch(()=>null);
-        if(!data){
-          throw createCaptchaError(source,url,page);
+        if(schema&&!schema(payload)){
+          if(attempt<retries){
+            await sleep(backoffMs(attempt,520,5200));
+            continue;
+          }
+          throw new Error('aicu payload schema mismatch');
         }
-        const code=Number(data.code);
-        const retryableCode=code===-666||code===-799||code===-412;
-        if(code===0&&(!schema||schema(data))){
-          return data;
-        }
-        if((retryableCode||(schema&&!schema(data)))&&attempt<retries){
-          await sleep(backoffMs(attempt,420,3600));
-          continue;
-        }
-        throw new Error('aicu code='+code);
+        return payload;
       }catch(err){
         if(err&&err.type==='captcha_required') throw err;
         lastError=String(err&&err.message?err.message:err);
         if(attempt>=retries) break;
-        await sleep(backoffMs(attempt,420,3600));
+        await sleep(backoffMs(attempt,520,5200));
       }
     }
     throw new Error(lastError);
@@ -884,8 +916,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     const listKey=AICU_LIST_KEY[source];
     while(cp.page<=500&&cp.items.length<maxItems){
       setStatus('抓取 '+source+' 第 '+cp.page+' 页');
-      const url=buildAicuUrl(source,state.uid,cp.page);
-      const payload=await requestAicuJson(source,url,cp.page,{retries:5,schema:(x)=>isAicuPayload(source,x)});
+      const payload=await requestAicuJson(state,source,cp.page,{retries:2,schema:(x)=>isAicuPayload(source,x)});
       const data=payload&&payload.data&&typeof payload.data==='object'?payload.data:{};
       const cursor=data&&data.cursor&&typeof data.cursor==='object'?data.cursor:{};
       const pageItems=Array.isArray(data[listKey])?data[listKey]:[];
@@ -1421,6 +1452,33 @@ const PROXY_AICU_LIST_KEY_BY_SOURCE = {
   danmu: "videodmlist",
   zhibodanmu: "list",
 };
+const COLLECT_AICU_SOURCES = Object.freeze(["comment", "danmu", "zhibodanmu"]);
+
+function isAicuRetryableBusinessCode(code) {
+  return code === -666 || code === -799 || code === -412;
+}
+
+function buildAicuUpstreamUrl(source, uid, page, keyword = "") {
+  if (source === "comment") {
+    return `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&mode=0`;
+  }
+  if (source === "danmu") {
+    return `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`;
+  }
+  if (source === "zhibodanmu") {
+    return `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`;
+  }
+  throw new HttpError(400, "source invalid");
+}
+
+function aicuUpstreamRequestHeaders() {
+  return {
+    accept: "application/json, text/plain, */*",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    origin: "https://www.aicu.cc",
+    referer: "https://www.aicu.cc/",
+  };
+}
 
 function isProxyAicuPayload(source, payload) {
   if (!isPlainObject(payload) || Number(payload.code) !== 0) return false;
@@ -1481,20 +1539,11 @@ async function handleProxy(request, env, url, requestId = "unknown") {
     const uid = parseRequiredUidOrThrow(rawUid, "allVid 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn"), 1, 200, 1);
     upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=50&pn=${pn}`;
-  } else if (source === "comment") {
-    const uid = parseRequiredUidOrThrow(rawUid, "comment 需要 uid");
-    const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
-    upstream = `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&mode=0`;
-  } else if (source === "danmu") {
-    const uid = parseRequiredUidOrThrow(rawUid, "danmu 需要 uid");
+  } else if (COLLECT_AICU_SOURCES.includes(source)) {
+    const uid = parseRequiredUidOrThrow(rawUid, `${source} requires uid`);
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
     const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
-    upstream = `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
-  } else if (source === "zhibodanmu") {
-    const uid = parseRequiredUidOrThrow(rawUid, "zhibodanmu 需要 uid");
-    const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
-    const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
-    upstream = `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
+    upstream = buildAicuUpstreamUrl(source, uid, pn, keyword);
   } else {
     if (bvid && /^BV[0-9A-Za-z]{10}$/.test(bvid)) {
       upstream = `https://uapis.cn/api/v1/social/bilibili/view?bvid=${encodeURIComponent(bvid)}`;
@@ -1510,6 +1559,7 @@ async function handleProxy(request, env, url, requestId = "unknown") {
     console.log("proxy_upstream_start", { requestId, source, upstream });
     const { data } = await upstreamClient.requestJson(upstream, {
       ...proxyRetryOptions(source),
+      headers: COLLECT_AICU_SOURCES.includes(source) ? aicuUpstreamRequestHeaders() : { accept: "application/json" },
       schema: (data) => proxySchemaValidator(source, data),
       retryOnSchemaFailure: true,
     });
@@ -1533,9 +1583,162 @@ async function handleProxy(request, env, url, requestId = "unknown") {
   }
 
   if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-    payload.dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
+    payload.dataNotice = String(env.DATA_NOTICE || "Third-party API data may be inaccurate.");
   }
   return jsonResponse(payload, 200, { "cache-control": "no-store" });
+}
+
+async function handleCollectAicu(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const uid = parseSingleUidOrThrow(body.uid);
+  const collectId = normalizeCollectId(body.collectId);
+  const collectToken = String(body.collectToken || "").trim();
+  const source = String(body.source || "").trim();
+  const page = parseBoundedInt(body.page ?? body.pn, 1, 1000, 1);
+  const keyword = sanitizeSearchKeyword(body.keyword);
+  if (!collectId) throw new HttpError(400, "collectId invalid");
+  if (!collectToken) throw new HttpError(400, "collectToken required");
+  if (!COLLECT_AICU_SOURCES.includes(source)) throw new HttpError(400, "source invalid");
+
+  await enforceIpRateLimit(env, request, "collect-aicu", COLLECT_AICU_LIMIT_PER_DAY, COLLECT_AICU_LIMIT_PER_MINUTE);
+  const collectPayload = await verifySignedToken(env, collectToken);
+  if (!collectPayload || collectPayload.scope !== "collect" || collectPayload.collectId !== collectId || collectPayload.uid !== uid) {
+    throw new HttpError(403, "collectToken invalid");
+  }
+  const collectSession = await env.REMEMBER_KV.get(`collect:${collectId}`, "json");
+  if (!collectSession || collectSession.uid !== uid) throw new HttpError(403, "collect session invalid");
+
+  const upstream = buildAicuUpstreamUrl(source, uid, page, keyword);
+  const retries = 5;
+  let sawChallenge = false;
+  let lastStatus = null;
+  let lastBusinessCode = null;
+  let lastReason = "aicu unknown";
+
+  for (let attempt = 1; attempt <= retries; attempt += 1) {
+    try {
+      const resp = await fetch(upstream, { headers: aicuUpstreamRequestHeaders() });
+      const status = Number(resp.status || 0);
+      lastStatus = Number.isFinite(status) ? status : null;
+      if (status === 468 || status === 412 || status === 403) {
+        sawChallenge = true;
+        lastReason = `status_${status}`;
+        if (attempt < retries) {
+          await sleepFor(computeBackoffMs(attempt, 350, 3200));
+          continue;
+        }
+        break;
+      }
+      if (!resp.ok) {
+        if (isRetryableUpstreamStatus(status) && attempt < retries) {
+          lastReason = `retryable_http_${status}`;
+          await sleepFor(computeBackoffMs(attempt, 300, 2600));
+          continue;
+        }
+        const upstreamText = await resp.text().catch(() => "");
+        lastReason = `http_${status}_${sanitizeFailureMessage(upstreamText)}`;
+        break;
+      }
+      if (!isJsonContentType(resp.headers.get("content-type"))) {
+        sawChallenge = true;
+        lastReason = "non_json";
+        if (attempt < retries) {
+          await sleepFor(computeBackoffMs(attempt, 350, 3200));
+          continue;
+        }
+        break;
+      }
+      const payload = await resp.json().catch(() => null);
+      if (!payload || typeof payload !== "object") {
+        sawChallenge = true;
+        lastReason = "invalid_json";
+        if (attempt < retries) {
+          await sleepFor(computeBackoffMs(attempt, 350, 3200));
+          continue;
+        }
+        break;
+      }
+
+      const code = Number(payload.code);
+      lastBusinessCode = Number.isFinite(code) ? code : null;
+      if (code === 468 || code === -468) {
+        sawChallenge = true;
+        lastReason = `code_${code}`;
+        if (attempt < retries) {
+          await sleepFor(computeBackoffMs(attempt, 350, 3200));
+          continue;
+        }
+        break;
+      }
+      if (code === 0 && isProxyAicuPayload(source, payload)) {
+        payload.dataNotice = String(env.DATA_NOTICE || "Third-party API data may be inaccurate.");
+        return jsonResponse(payload, 200, { "cache-control": "no-store" });
+      }
+      if ((isAicuRetryableBusinessCode(code) || (code === 0 && !isProxyAicuPayload(source, payload))) && attempt < retries) {
+        lastReason = Number.isFinite(code) ? `retryable_code_${code}` : "retryable_schema";
+        await sleepFor(computeBackoffMs(attempt, 320, 3000));
+        continue;
+      }
+      if (code !== 0) {
+        return jsonResponse(
+          {
+            error: "aicu business error",
+            code: "aicu_business_error",
+            source,
+            page,
+            businessCode: code,
+          },
+          502,
+          { "cache-control": "no-store" },
+        );
+      }
+      return jsonResponse(
+        {
+          error: "aicu payload invalid",
+          code: "aicu_payload_invalid",
+          source,
+          page,
+        },
+        502,
+        { "cache-control": "no-store" },
+      );
+    } catch (err) {
+      lastReason = sanitizeFailureMessage(err?.message || err);
+      if (attempt < retries) {
+        await sleepFor(computeBackoffMs(attempt, 300, 2600));
+        continue;
+      }
+      break;
+    }
+  }
+
+  if (sawChallenge) {
+    return jsonResponse(
+      {
+        error: "AICU requires verification",
+        code: "aicu_verify_required",
+        source,
+        page,
+        verifyUrl: upstream,
+      },
+      409,
+      { "cache-control": "no-store" },
+    );
+  }
+
+  return jsonResponse(
+    {
+      error: "aicu upstream unavailable",
+      code: "aicu_upstream_unavailable",
+      source,
+      page,
+      upstreamStatus: lastStatus,
+      businessCode: lastBusinessCode,
+      reason: lastReason,
+    },
+    503,
+    { "cache-control": "no-store" },
+  );
 }
 
 async function handleCollectInit(request, env) {
@@ -2054,6 +2257,7 @@ async function handleFetch(request, env, ctx) {
     }
     if (request.method === "GET" && path.startsWith("/api/proxy/")) return applyCorsToResponse(await handleProxy(request, env, url, requestId), cors);
     if (request.method === "POST" && path === "/api/collect/init") return applyCorsToResponse(await handleCollectInit(request, env), cors);
+    if (request.method === "POST" && path === "/api/collect/aicu") return applyCorsToResponse(await handleCollectAicu(request, env), cors);
     if (request.method === "POST" && path === "/api/upload/init") return applyCorsToResponse(await handleUploadInit(request, env), cors);
     if (request.method === "PUT" && path === "/api/upload/part") return applyCorsToResponse(await handleUploadPart(request, env, url), cors);
     if (request.method === "POST" && path === "/api/upload/complete") return applyCorsToResponse(await handleUploadComplete(request, env), cors);

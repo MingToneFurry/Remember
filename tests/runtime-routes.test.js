@@ -206,13 +206,106 @@ test("GET / should render warning script without innerHTML injection", async () 
   assert.equal(html.includes("warningList.replaceChildren()"), true);
   assert.equal(html.includes("li.textContent=String(warning)"), true);
   assert.equal(html.includes("/api/collect/init"), true);
+  assert.equal(html.includes("/api/collect/aicu"), true);
   assert.equal(html.includes("/api/upload/init"), true);
   assert.equal(html.includes("aicu_verify_required"), true);
   assert.equal(html.includes("verify-continue-btn"), true);
   assert.equal(html.includes("createCaptchaError"), true);
-  assert.equal(html.includes("status===468"), true);
+  assert.equal(html.includes("status===468"), false);
   assert.equal(html.includes("输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。"), false);
   assert.equal(html.includes("remember-site-theme-v1"), true);
+});
+
+test("POST /api/collect/aicu should return payload for valid collect session", async () => {
+  const env = createEnv();
+  let upstreamCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    if (target.startsWith("https://api.aicu.cc/api/v3/search/getreply")) {
+      upstreamCalls += 1;
+      return jsonResponse(200, {
+        code: 0,
+        data: {
+          cursor: { is_end: true, all_count: 1 },
+          replies: [{ rpid: "1", message: "ok" }],
+        },
+      });
+    }
+    throw new Error(`unexpected fetch ${target}`);
+  };
+
+  try {
+    const collect = await createReadyCollectSession(env, "123456");
+    const response = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/collect/aicu", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          uid: "123456",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+          source: "comment",
+          page: 1,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.code, 0);
+    assert.equal(Array.isArray(body?.data?.replies), true);
+    assert.equal(upstreamCalls >= 1, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("POST /api/collect/aicu should return verify_required when upstream stays challenged", async () => {
+  const env = createEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    if (target.startsWith("https://api.aicu.cc/api/v3/search/getreply")) {
+      return new Response("<html>challenge</html>", {
+        status: 468,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    throw new Error(`unexpected fetch ${target}`);
+  };
+
+  try {
+    const collect = await createReadyCollectSession(env, "123456");
+    const response = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/collect/aicu", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          uid: "123456",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+          source: "comment",
+          page: 1,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(response.status, 409);
+    const body = await response.json();
+    assert.equal(body.code, "aicu_verify_required");
+    assert.equal(String(body.verifyUrl || "").includes("https://api.aicu.cc/api/v3/search/getreply"), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("POST /api/generate should enqueue job and job endpoint should return stage/progress", async () => {
