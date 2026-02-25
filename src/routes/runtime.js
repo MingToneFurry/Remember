@@ -630,7 +630,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     return err;
   }
   function parseSingleUidInput(input){
-    const edgeSeparators=' ,;|~!?"\'()[]{}<>';
+    const edgeSeparators=' ,;|~!?\"\\'()[]{}<>';
     const normalized=String(input??'')
       .normalize('NFKC')
       .replaceAll('\u200b','')
