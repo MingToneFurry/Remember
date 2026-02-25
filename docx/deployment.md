@@ -67,6 +67,14 @@ npx wrangler r2 bucket create remember-data
 npx wrangler queues create remember-analysis
 ```
 
+如果出现 `The specified queue settings are invalid`（错误码 100128），按账户上限显式指定保留时长：
+
+```bash
+npx wrangler queues create remember-analysis --message-retention-period-secs 86400
+```
+
+说明：部分账户当前 `message_retention_period` 上限是 `86400` 秒，而不是 `345600` 秒。
+
 ### 2.2.4 Turnstile
 
 在 Cloudflare Dashboard 创建 Turnstile Site：
@@ -310,6 +318,12 @@ npx wrangler deploy --env production
 
 - 原因：Queue 名称或权限不匹配
 - 处理：核对 `wrangler.toml` 队列名与 Cloudflare 账户下队列一致，必要时补 `Queues Edit`
+
+### 8.5 `The specified queue settings are invalid`
+
+- 常见报错：`message_retention_period must be between 60 and 86400 seconds`
+- 原因：账户允许的消息保留上限低于 Wrangler 默认值
+- 处理：创建队列时显式使用 `--message-retention-period-secs 86400`
 
 ---
 
