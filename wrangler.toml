@@ -70,4 +70,4 @@ max_batch_size = 1
 max_batch_timeout = 3
 
 [env.production.triggers]
-crons = ["0 4 * * *"]
+crons = ["15 * * * *"]

@@ -822,6 +822,95 @@ test("queue should ack running jobs without reprocessing", async () => {
   assert.equal(retryCount, 0);
 });
 
+test("scheduled cleanup should remove expired raw objects and stale collect/upload sessions", async () => {
+  const memoryR2 = createMemoryR2();
+  const now = Date.now();
+  const oldTs = now - 25 * 3600 * 1000;
+  memoryR2.__store.set("raw/old/object.json", { body: "{}", uploaded: new Date(oldTs) });
+  memoryR2.__store.set("raw/new/object.json", { body: "{}", uploaded: new Date(now) });
+
+  const collectLive = "collect_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const collectExpired = "collect_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const collectOrphan = "collect_cccccccccccccccccccccccccccccccc";
+  const env = createEnv({ REMEMBER_DATA: memoryR2 });
+
+  await env.REMEMBER_KV.put(
+    `collect:${collectLive}`,
+    JSON.stringify({
+      collectId: collectLive,
+      uid: "10001",
+      status: "collecting",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: now + 3600 * 1000,
+    }),
+  );
+  await env.REMEMBER_KV.put(
+    `collect:${collectExpired}`,
+    JSON.stringify({
+      collectId: collectExpired,
+      uid: "10002",
+      status: "collecting",
+      createdAt: oldTs,
+      updatedAt: oldTs,
+      expiresAt: oldTs + 1000,
+    }),
+  );
+
+  await env.REMEMBER_KV.put(
+    "upload:upload-old",
+    JSON.stringify({
+      uid: "10001",
+      collectId: collectLive,
+      key: "raw/old/upload-part.json",
+      createdAt: oldTs,
+    }),
+  );
+  await env.REMEMBER_KV.put(
+    "upload:upload-orphan",
+    JSON.stringify({
+      uid: "10003",
+      collectId: collectOrphan,
+      key: "raw/new/orphan-upload-part.json",
+      createdAt: now,
+    }),
+  );
+  await env.REMEMBER_KV.put(
+    "upload:upload-live",
+    JSON.stringify({
+      uid: "10001",
+      collectId: collectLive,
+      key: "raw/new/live-upload-part.json",
+      createdAt: now,
+    }),
+  );
+
+  await env.REMEMBER_KV.put(
+    "uploads:index:10001",
+    JSON.stringify([
+      { uploadId: "upload-old", collectId: collectLive, createdAt: oldTs },
+      { uploadId: "upload-live", collectId: collectLive, createdAt: now },
+      { uploadId: "upload-orphan", collectId: collectOrphan, createdAt: now },
+    ]),
+  );
+
+  const ctx = createAsyncCtx();
+  runtime.scheduled({ cron: "15 * * * *" }, env, ctx);
+  await ctx.flush();
+
+  assert.equal(memoryR2.__store.has("raw/old/object.json"), false);
+  assert.equal(memoryR2.__store.has("raw/new/object.json"), true);
+  assert.equal(await env.REMEMBER_KV.get(`collect:${collectExpired}`), null);
+  assert.notEqual(await env.REMEMBER_KV.get(`collect:${collectLive}`), null);
+  assert.equal(await env.REMEMBER_KV.get("upload:upload-old"), null);
+  assert.equal(await env.REMEMBER_KV.get("upload:upload-orphan"), null);
+  assert.notEqual(await env.REMEMBER_KV.get("upload:upload-live"), null);
+  const index = await env.REMEMBER_KV.get("uploads:index:10001", "json");
+  assert.equal(Array.isArray(index), true);
+  assert.equal(index.length, 1);
+  assert.equal(index[0].uploadId, "upload-live");
+});
+
 test("PUT /api/upload/part should be rate-limited", async () => {
   const env = createEnv();
   const ip = "1.2.3.4";

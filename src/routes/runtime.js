@@ -2042,30 +2042,89 @@ async function handleFetch(request, env, ctx) {
 
 async function handleScheduled(event, env) {
   const now = Date.now();
-  const sevenDaysAgo = now - 7 * 24 * 3600 * 1000;
+  const retentionMs = 24 * 3600 * 1000;
+  const cutoff = now - retentionMs;
+  const liveCollectIds = new Set();
 
   let r2Cursor = undefined;
   do {
     const list = await env.REMEMBER_DATA.list({ prefix: "raw/", cursor: r2Cursor });
     for (const obj of list.objects) {
-      if (obj.uploaded.getTime() < sevenDaysAgo) {
+      const uploadedAt = Number(obj?.uploaded?.getTime?.() || 0);
+      if (uploadedAt > 0 && uploadedAt < cutoff) {
         await env.REMEMBER_DATA.delete(obj.key);
       }
     }
     r2Cursor = list.truncated ? list.cursor : undefined;
   } while (r2Cursor);
 
-  let kvCursor = undefined;
+  let collectCursor = undefined;
   do {
-    const kvUploads = await env.REMEMBER_KV.list({ prefix: "upload:", cursor: kvCursor });
+    const kvCollect = await env.REMEMBER_KV.list({ prefix: "collect:", cursor: collectCursor });
+    for (const key of kvCollect.keys) {
+      const session = await env.REMEMBER_KV.get(key.name, "json");
+      if (!session || typeof session !== "object") {
+        await env.REMEMBER_KV.delete(key.name);
+        continue;
+      }
+      const updatedAt = Number(session.updatedAt || session.createdAt || 0);
+      const expiresAt = Number(session.expiresAt || 0);
+      const expiredByUpdate = updatedAt > 0 ? updatedAt < cutoff : true;
+      const expiredByExpiresAt = Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt < now : false;
+      if (expiredByUpdate || expiredByExpiresAt) {
+        await env.REMEMBER_KV.delete(key.name);
+        continue;
+      }
+      const collectId = normalizeCollectId(session.collectId || key.name.slice("collect:".length));
+      if (collectId) liveCollectIds.add(collectId);
+    }
+    collectCursor = kvCollect.list_complete ? undefined : kvCollect.cursor;
+  } while (collectCursor);
+
+  let uploadCursor = undefined;
+  do {
+    const kvUploads = await env.REMEMBER_KV.list({ prefix: "upload:", cursor: uploadCursor });
     for (const key of kvUploads.keys) {
-      const v = await env.REMEMBER_KV.get(key.name, "json");
-      if (v && v.createdAt && now - v.createdAt > 24 * 3600 * 1000) {
+      const session = await env.REMEMBER_KV.get(key.name, "json");
+      if (!session || typeof session !== "object") {
+        await env.REMEMBER_KV.delete(key.name);
+        continue;
+      }
+      const createdAt = Number(session.createdAt || 0);
+      const collectId = normalizeCollectId(session.collectId);
+      const expired = createdAt > 0 ? createdAt < cutoff : true;
+      const orphan = Boolean(collectId) && !liveCollectIds.has(collectId);
+      if (expired || orphan) {
+        if (session.key && expired) {
+          await env.REMEMBER_DATA.delete(String(session.key)).catch(() => {});
+        }
         await env.REMEMBER_KV.delete(key.name);
       }
     }
-    kvCursor = kvUploads.list_complete ? undefined : kvUploads.cursor;
-  } while (kvCursor);
+    uploadCursor = kvUploads.list_complete ? undefined : kvUploads.cursor;
+  } while (uploadCursor);
+
+  let indexCursor = undefined;
+  do {
+    const kvIndexes = await env.REMEMBER_KV.list({ prefix: "uploads:index:", cursor: indexCursor });
+    for (const key of kvIndexes.keys) {
+      const raw = await env.REMEMBER_KV.get(key.name, "json");
+      const list = Array.isArray(raw) ? raw : [];
+      const filtered = list.filter((item) => {
+        const createdAt = Number(item?.createdAt || 0);
+        const collectId = normalizeCollectId(item?.collectId);
+        if (!createdAt || createdAt < cutoff) return false;
+        if (collectId && !liveCollectIds.has(collectId)) return false;
+        return true;
+      });
+      if (filtered.length === 0) {
+        await env.REMEMBER_KV.delete(key.name);
+      } else if (filtered.length !== list.length) {
+        await env.REMEMBER_KV.put(key.name, JSON.stringify(filtered.slice(-200)));
+      }
+    }
+    indexCursor = kvIndexes.list_complete ? undefined : kvIndexes.cursor;
+  } while (indexCursor);
 }
 
 function parseQueueMessageBody(body) {
