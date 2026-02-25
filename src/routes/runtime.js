@@ -519,8 +519,8 @@ function homepageHtml(siteKey, scriptNonce = "") {
         <div id="verify-box" class="verify-box full" hidden>
           <div id="verify-text" class="hint"></div>
           <div class="verify-actions">
-            <a id="verify-link" class="verify-link" target="_blank" rel="noopener noreferrer">????</a>
-            <button id="verify-continue-btn" class="site-button" type="button">?????</button>
+            <a id="verify-link" class="verify-link" target="_blank" rel="noopener noreferrer">前往验证</a>
+            <button id="verify-continue-btn" class="site-button" type="button">已验证，继续</button>
           </div>
         </div>
       </form>
@@ -539,7 +539,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     </section>
   </main>
   <script nonce="${safeText(scriptNonce)}">
-  const STAGE_LABELS={collecting:'?????',uploading:'??????',aicu_verify_required:'?? AICU ??',queued:'???',fetching:'????',analyzing:'????',rendering:'????',syncing:'????',succeeded:'???',failed:'???'};
+  const STAGE_LABELS={collecting:'采集中',uploading:'上传中',aicu_verify_required:'AICU 人机验证',queued:'排队中',fetching:'取数中',analyzing:'分析中',rendering:'渲染中',syncing:'同步中',succeeded:'已完成',failed:'失败'};
   const REQUIRED_ARTIFACTS=['allVid','comment','danmu','zhibodanmu','topVideoInfos'];
   const AICU_LIST_KEY={comment:'replies',danmu:'videodmlist',zhibodanmu:'list'};
   const statusLine=document.getElementById('status-line');
@@ -563,7 +563,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
   function setStatus(text){statusLine.textContent=String(text||'');}
   function setStage(stage,progress){
     const label=STAGE_LABELS[stage]||stage||'-';
-    stageLine.textContent='??: '+label;
+    stageLine.textContent='阶段: '+label;
     const safeProgress=Number.isFinite(Number(progress))?Math.max(0,Math.min(100,Number(progress))):0;
     progressBar.style.width=safeProgress+'%';
   }
@@ -594,16 +594,16 @@ function homepageHtml(siteKey, scriptNonce = "") {
   function showVerifyBox(state,err){
     const source=String(err.source||'aicu');
     const page=Number(err.page||0);
-    verifyText.textContent='AICU '+source+' ? '+(page||'?')+' ?????????????????????????';
+    verifyText.textContent='AICU '+source+' 第 '+(page||'?')+' 页触发验证，请先在新窗口完成人机验证。';
     verifyLink.href=String(err.verifyUrl||'https://api.aicu.cc/');
     verifyBox.hidden=false;
     setStage('aicu_verify_required',35);
-    setStatus('????? AICU ????');
+    setStatus('等待 AICU 人机验证');
     sourceHint.textContent='collectId='+String(state.collectId||'');
   }
   function ensureTurnstileToken(){
     const token=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
-    if(!token) throw new Error('???? Turnstile ??');
+    if(!token) throw new Error('请先完成 Turnstile 验证');
     return token;
   }
   function isJsonResponse(resp){
@@ -621,7 +621,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     return Math.min(cap,Math.round(b*Math.pow(1.8,n-1)));
   }
   function createCaptchaError(source,url,page){
-    const err=new Error('AICU ??????');
+    const err=new Error('AICU 需要人机验证');
     err.type='captcha_required';
     err.state='aicu_verify_required';
     err.source=source;
@@ -630,7 +630,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     return err;
   }
   function parseSingleUidInput(input){
-    const edgeSeparators=' ,???|~!"????()??{}[]<>??????';
+    const edgeSeparators=' ,;|~!?"\'()[]{}<>';
     const normalized=String(input??'')
       .normalize('NFKC')
       .replaceAll('\u200b','')
@@ -728,7 +728,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
             await sleep(backoffMs(attempt,350,3200));
             continue;
           }
-          throw new Error('uapis ??? JSON');
+          throw new Error('uapis 返回非 JSON');
         }
         const data=await resp.json().catch(()=>null);
         if(!data){
@@ -736,14 +736,14 @@ function homepageHtml(siteKey, scriptNonce = "") {
             await sleep(backoffMs(attempt,350,3200));
             continue;
           }
-          throw new Error('uapis JSON ????');
+          throw new Error('uapis JSON 解析失败');
         }
         if(schema&&!schema(data)){
           if(attempt<retries){
             await sleep(backoffMs(attempt,350,3200));
             continue;
           }
-          throw new Error('uapis payload ?????');
+          throw new Error('uapis payload 不符合预期');
         }
         return data;
       }catch(err){
@@ -762,12 +762,20 @@ function homepageHtml(siteKey, scriptNonce = "") {
     for(let attempt=1;attempt<=retries;attempt++){
       try{
         const resp=await fetch(url,{headers:{accept:'application/json'}});
+        const status=Number(resp.status||0);
+        const challengeStatus=status===468||status===412||status===403;
+        if(challengeStatus){
+          throw createCaptchaError(source,url,page);
+        }
         if(!resp.ok){
-          if(isRetryableStatus(resp.status)&&attempt<retries){
+          if(!isJsonResponse(resp)){
+            throw createCaptchaError(source,url,page);
+          }
+          if(isRetryableStatus(status)&&attempt<retries){
             await sleep(backoffMs(attempt,420,3600));
             continue;
           }
-          throw new Error('aicu HTTP '+resp.status);
+          throw new Error('aicu HTTP '+status);
         }
         if(!isJsonResponse(resp)){
           throw createCaptchaError(source,url,page);
@@ -798,13 +806,32 @@ function homepageHtml(siteKey, scriptNonce = "") {
 
   async function loadRecent(){
     const ul=document.getElementById('recent-list');
+    ul.replaceChildren();
     try{
       const resp=await fetch('/api/recent?limit=10',{headers:{accept:'application/json'}});
       const data=await resp.json();
       const items=Array.isArray(data.items)?data.items:[];
-      ul.innerHTML=items.map((item)=>'<li><a href="/u/'+encodeURIComponent(item.uid)+'">UID '+String(item.uid)+'</a> ? '+new Date(item.createdAt).toLocaleString()+'</li>').join('')||'<li>????</li>';
+      if(items.length===0){
+        const li=document.createElement('li');
+        li.textContent='暂无数据';
+        ul.appendChild(li);
+        return;
+      }
+      for(const item of items){
+        const li=document.createElement('li');
+        const a=document.createElement('a');
+        a.href='/u/'+encodeURIComponent(item.uid);
+        a.textContent='UID '+String(item.uid);
+        li.appendChild(a);
+        const ts=Number(item&&item.createdAt);
+        const when=Number.isFinite(ts)&&ts>0?new Date(ts).toLocaleString():'-';
+        li.appendChild(document.createTextNode(' · '+when));
+        ul.appendChild(li);
+      }
     }catch{
-      ul.innerHTML='<li>??????????</li>';
+      const li=document.createElement('li');
+      li.textContent='最近列表加载失败';
+      ul.appendChild(li);
     }
   }
 
@@ -832,7 +859,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     const cp=state.checkpoints.allVid||{page:1,total:null,videos:[]};
     const pageSize=50;
     while(cp.page<=300){
-      setStatus('???????? '+cp.page+' ?');
+      setStatus('抓取投稿列表第 '+cp.page+' 页');
       const url='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(state.uid)+'&ps='+pageSize+'&pn='+cp.page;
       const data=await requestUapisJson(url,{retries:5,schema:isAllVidPayload});
       const archive=normalizeArchivePayload(data);
@@ -856,7 +883,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     const cp=state.checkpoints[source]||{page:1,total:0,items:[]};
     const listKey=AICU_LIST_KEY[source];
     while(cp.page<=500&&cp.items.length<maxItems){
-      setStatus('?? '+source+'?? '+cp.page+' ?');
+      setStatus('抓取 '+source+' 第 '+cp.page+' 页');
       const url=buildAicuUrl(source,state.uid,cp.page);
       const payload=await requestAicuJson(source,url,cp.page,{retries:5,schema:(x)=>isAicuPayload(source,x)});
       const data=payload&&payload.data&&typeof payload.data==='object'?payload.data:{};
@@ -889,7 +916,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
         cp.index+=1;
         continue;
       }
-      setStatus('???????'+(cp.index+1)+' / '+topVideos.length);
+      setStatus('抓取视频详情 '+(cp.index+1)+' / '+topVideos.length);
       const query=bvid?'bvid='+encodeURIComponent(bvid):('aid='+encodeURIComponent(aid));
       try{
         const payload=await requestUapisJson('https://uapis.cn/api/v1/social/bilibili/view?'+query,{retries:5,schema:isVidInfoPayload});
@@ -901,7 +928,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
           data,
         });
       }catch(err){
-        appendWarning('?????????????'+String(err&&err.message?err.message:err));
+        appendWarning('视频详情抓取失败：'+String(err&&err.message?err.message:err));
       }
       cp.index+=1;
       state.checkpoints.topVideoInfos=cp;
@@ -984,9 +1011,9 @@ function homepageHtml(siteKey, scriptNonce = "") {
     setStage('uploading',45);
     for(const artifact of state.requiredArtifacts){
       if(!(artifact in state.artifacts)){
-        throw new Error('??????: '+artifact);
+        throw new Error('缺少采集产物: '+artifact);
       }
-      setStatus('?? '+artifact+'...');
+      setStatus('上传 '+artifact+'...');
       const result=await uploadArtifact(state,artifact,state.artifacts[artifact]);
       if(result&&typeof result==='object'&&result.collectStatus){
         sourceHint.textContent='collect '+String(result.collectStatus)+' '+String(result.uploadedCount||0)+'/'+String(result.requiredCount||state.requiredArtifacts.length);
@@ -1003,11 +1030,11 @@ function homepageHtml(siteKey, scriptNonce = "") {
     });
     const data=await resp.json().catch(()=>({}));
     if(!resp.ok){
-      throw new Error(String(data.error||'????????'));
+      throw new Error(String(data.error||'创建采集会话失败'));
     }
     const state=createCollectState(uid,data);
     if(!state.collectId||!state.collectToken){
-      throw new Error('?????????');
+      throw new Error('采集会话初始化失败');
     }
     return state;
   }
@@ -1025,7 +1052,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
       }),
     });
     const data=await resp.json().catch(()=>({}));
-    if(!resp.ok) throw new Error(String(data.error||'??????'));
+    if(!resp.ok) throw new Error(String(data.error||'创建任务失败'));
     return data;
   }
 
@@ -1035,13 +1062,13 @@ function homepageHtml(siteKey, scriptNonce = "") {
       const resp=await fetch('/api/job/'+encodeURIComponent(jobId),{headers:{accept:'application/json'}});
       const job=await resp.json();
       if(!resp.ok){
-        errorLine.textContent=String(job.error||'????????');
+        errorLine.textContent=String(job.error||'任务状态查询失败');
         return;
       }
       setStage(job.stage,job.progress);
       renderWarnings(job.warnings);
       if(job.status==='succeeded'){
-        setStatus('???????????');
+        setStatus('任务完成，页面已生成');
         if(job.url){
           location.href=job.url;
           return;
@@ -1050,14 +1077,14 @@ function homepageHtml(siteKey, scriptNonce = "") {
         return;
       }
       if(job.status==='failed'){
-        setStatus('????');
-        errorLine.textContent=String(job.error||'????');
+        setStatus('任务失败');
+        errorLine.textContent=String(job.error||'生成失败');
         return;
       }
       const waitSec=Math.max(0,Math.round((240-i)*1.5));
-      setStatus('???????????? '+waitSec+' ?');
+      setStatus('任务处理中，预计还需 '+waitSec+' 秒');
     }
-    setStatus('????????????');
+    setStatus('任务处理超时，请稍后手动刷新');
   }
 
   async function runPipeline(state){
@@ -1066,9 +1093,9 @@ function homepageHtml(siteKey, scriptNonce = "") {
     try{
       await collectRequiredArtifacts(state);
       await uploadCollectedArtifacts(state);
-      setStatus('??????...');
+      setStatus('创建生成任务...');
       const job=await createGenerateJob(state);
-      setStatus('?????????? '+String(job.estimatedWaitSec||'-')+' ?');
+      setStatus('任务已排队，预计等待 '+String(job.estimatedWaitSec||'-')+' 秒');
       setStage(job.stage||'queued',70);
       await pollJob(job.jobId);
       await loadRecent();
@@ -1077,7 +1104,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
       if(err&&err.type==='captcha_required'){
         resumeCollectState=state;
         showVerifyBox(state,err);
-        appendWarning('AICU ???????????????????????');
+        appendWarning('AICU 需要人机验证，请在新窗口完成验证后继续。');
         return;
       }
       throw err;
@@ -1095,7 +1122,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     hideVerifyBox();
     const parsed=parseSingleUidInput(uidInput.value);
     if(!parsed.uid){
-      errorLine.textContent=parsed.code==='multi_uid'?'???? UID????????? UID':'UID ???????? 1-20 ???';
+      errorLine.textContent=parsed.code==='multi_uid'?'检测到多个 UID，请一次只提交一个 UID':'UID 格式不正确（1-20 位数字）';
       return;
     }
     const uid=parsed.uid;
@@ -1103,7 +1130,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     submitBtn.disabled=true;
     try{
       setStage('collecting',5);
-      setStatus('??????...');
+      setStatus('初始化采集会话...');
       const state=await createCollectSession(uid);
       resumeCollectState=state;
       sourceHint.textContent='collectId='+state.collectId;
@@ -1121,7 +1148,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
     verifyContinueBtn.disabled=true;
     submitBtn.disabled=true;
     try{
-      setStatus('?????????...');
+      setStatus('继续采集中...');
       await runPipeline(resumeCollectState);
     }catch(err){
       errorLine.textContent=String(err&&err.message?err.message:err);
@@ -1241,11 +1268,16 @@ async function processGenerateJob(env, jobId) {
     await env.REMEMBER_KV.put(jobKey, JSON.stringify(merged), { expirationTtl: 24 * 3600 });
     return merged;
   };
+  const cooldownKey = `cooldown:uid:${uid}`;
+  const clearUidCooldown = async () => {
+    await env.REMEMBER_KV.delete(cooldownKey);
+  };
 
   await patchJob({ status: "running", stage: "fetching", progress: 10 });
   try {
     const collectId = normalizeCollectId(current.collectId);
     if (!collectId) {
+      await clearUidCooldown();
       await patchJob({
         status: "failed",
         stage: "failed",
@@ -1257,6 +1289,7 @@ async function processGenerateJob(env, jobId) {
 
     const collectSession = await env.REMEMBER_KV.get(`collect:${collectId}`, "json");
     if (!collectSession || collectSession.uid !== uid) {
+      await clearUidCooldown();
       await patchJob({
         status: "failed",
         stage: "failed",
@@ -1274,6 +1307,7 @@ async function processGenerateJob(env, jobId) {
       : {};
     const missingArtifacts = requiredArtifacts.filter((artifact) => !normalizeUploadedArtifactMeta(uploadedArtifacts[artifact]));
     if (missingArtifacts.length > 0) {
+      await clearUidCooldown();
       await patchJob({
         status: "failed",
         stage: "failed",
@@ -1294,6 +1328,7 @@ async function processGenerateJob(env, jobId) {
       }
     }
     if (warnings.length > 0) {
+      await clearUidCooldown();
       await patchJob({
         status: "failed",
         stage: "failed",
@@ -1353,6 +1388,7 @@ async function processGenerateJob(env, jobId) {
     }
     await patchJob({ status: "succeeded", stage: "succeeded", progress: 100, url: item.url, warnings, gitSync });
   } catch (err) {
+    await clearUidCooldown();
     const safeMessage = sanitizeFailureMessage(err?.message || err);
     await patchJob({
       status: "failed",

@@ -210,6 +210,7 @@ test("GET / should render warning script without innerHTML injection", async () 
   assert.equal(html.includes("aicu_verify_required"), true);
   assert.equal(html.includes("verify-continue-btn"), true);
   assert.equal(html.includes("createCaptchaError"), true);
+  assert.equal(html.includes("status===468"), true);
   assert.equal(html.includes("输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。"), false);
   assert.equal(html.includes("remember-site-theme-v1"), true);
 });
@@ -393,6 +394,67 @@ test("POST /api/generate should rollback cooldown and return 503 when queue send
     assert.equal(secondResp.status, 202);
     const secondBody = await secondResp.json();
     assert.equal(secondBody.queued, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed generate job should clear uid cooldown so retry can continue", async () => {
+  const env = createEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    throw new Error(`unexpected fetch ${String(url)}`);
+  };
+
+  try {
+    const uid = "445566";
+    const collect = await createReadyCollectSession(env, uid);
+    const createRequest = () =>
+      new Request("https://rem.furry.ist/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          uid,
+          turnstileToken: "ok-token",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+        }),
+      });
+
+    const firstResp = await runtime.fetch(createRequest(), env, createCtx());
+    assert.equal(firstResp.status, 202);
+    const firstBody = await firstResp.json();
+
+    let ackCount = 0;
+    let retryCount = 0;
+    const msg = {
+      body: JSON.stringify({
+        jobId: firstBody.jobId,
+        uid,
+        collectId: collect.collectId,
+      }),
+      ack() {
+        ackCount += 1;
+      },
+      retry() {
+        retryCount += 1;
+      },
+    };
+    const queueCtx = createAsyncCtx();
+    runtime.queue({ messages: [msg] }, env, queueCtx);
+    await queueCtx.flush();
+
+    assert.equal(ackCount, 1);
+    assert.equal(retryCount, 0);
+    const failedJob = await env.REMEMBER_KV.get(`job:${firstBody.jobId}`, "json");
+    assert.equal(failedJob.status, "failed");
+    assert.equal(await env.REMEMBER_KV.get(`cooldown:uid:${uid}`), null);
+
+    const secondResp = await runtime.fetch(createRequest(), env, createCtx());
+    assert.equal(secondResp.status, 202);
   } finally {
     globalThis.fetch = originalFetch;
   }
