@@ -99,6 +99,43 @@ function createAsyncCtx() {
   };
 }
 
+async function createReadyCollectSession(env, uid, turnstileToken = "ok-token") {
+  const collectResp = await runtime.fetch(
+    new Request("https://rem.furry.ist/api/collect/init", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid, turnstileToken }),
+    }),
+    env,
+    createCtx(),
+  );
+  assert.equal(collectResp.status, 200);
+  const collectData = await collectResp.json();
+  const sessionKey = `collect:${collectData.collectId}`;
+  const session = await env.REMEMBER_KV.get(sessionKey, "json");
+  const uploadedArtifacts = {};
+  for (const artifact of collectData.requiredArtifacts || []) {
+    uploadedArtifacts[artifact] = {
+      artifact,
+      key: `raw/mock/${uid}/${collectData.collectId}/${artifact}.json`,
+      fileName: `${artifact}.json`,
+      mime: "application/json",
+      size: 1,
+      uploadedAt: Date.now(),
+    };
+  }
+  await env.REMEMBER_KV.put(
+    sessionKey,
+    JSON.stringify({
+      ...session,
+      status: "ready",
+      uploadedArtifacts,
+      updatedAt: Date.now(),
+    }),
+  );
+  return collectData;
+}
+
 function buildMinuteRateLimitKey(scope, ip, date = new Date()) {
   const minute = `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}${String(date.getUTCHours()).padStart(2, "0")}${String(date.getUTCMinutes()).padStart(2, "0")}`;
   return `rl:ipm:${scope}:${ip}:${minute}`;
@@ -136,11 +173,17 @@ test("POST /api/generate should enqueue job and job endpoint should return stage
     throw new Error(`unexpected fetch ${String(url)}`);
   };
   try {
+    const collect = await createReadyCollectSession(env, "123456");
     const createResp = await runtime.fetch(
       new Request("https://rem.furry.ist/api/generate", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ uid: "123456", turnstileToken: "ok-token" }),
+        body: JSON.stringify({
+          uid: "123456",
+          turnstileToken: "ok-token",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+        }),
       }),
       env,
       createCtx(),
@@ -150,12 +193,15 @@ test("POST /api/generate should enqueue job and job endpoint should return stage
     assert.equal(created.queued, true);
     assert.equal(created.stage, "queued");
     assert.equal(env.__queueMessages.length, 1);
+    const queuePayload = JSON.parse(env.__queueMessages[0]);
+    assert.equal(queuePayload.collectId, collect.collectId);
 
     const jobResp = await runtime.fetch(new Request(`https://rem.furry.ist/api/job/${created.jobId}`, { method: "GET" }), env, createCtx());
     assert.equal(jobResp.status, 200);
     const job = await jobResp.json();
     assert.equal(job.stage, "queued");
     assert.equal(job.progress, 0);
+    assert.equal(job.collectId, collect.collectId);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -173,11 +219,17 @@ test("POST /api/generate should accept numeric UID samples", async () => {
 
   try {
     for (const uid of ["1933865292", "15918883740"]) {
+      const collect = await createReadyCollectSession(env, uid);
       const response = await runtime.fetch(
         new Request("https://rem.furry.ist/api/generate", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ uid, turnstileToken: "ok-token" }),
+          body: JSON.stringify({
+            uid,
+            turnstileToken: "ok-token",
+            collectId: collect.collectId,
+            collectToken: collect.collectToken,
+          }),
         }),
         env,
         createCtx(),
@@ -201,11 +253,17 @@ test("POST /api/generate should normalize full-width uid input", async () => {
   };
 
   try {
+    const collect = await createReadyCollectSession(env, "1933865292");
     const response = await runtime.fetch(
       new Request("https://rem.furry.ist/api/generate", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ uid: "１９３３８６５２９２", turnstileToken: "ok-token" }),
+        body: JSON.stringify({
+          uid: "\uFF11\uFF19\uFF13\uFF13\uFF18\uFF16\uFF15\uFF12\uFF19\uFF12",
+          turnstileToken: "ok-token",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+        }),
       }),
       env,
       createCtx(),
@@ -214,6 +272,7 @@ test("POST /api/generate should normalize full-width uid input", async () => {
     assert.equal(env.__queueMessages.length, 1);
     const payload = JSON.parse(env.__queueMessages[0]);
     assert.equal(payload.uid, "1933865292");
+    assert.equal(payload.collectId, collect.collectId);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -225,7 +284,12 @@ test("POST /api/generate should reject multi uid input", async () => {
     new Request("https://rem.furry.ist/api/generate", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ uid: "1933865292 15918883740", turnstileToken: "unused" }),
+      body: JSON.stringify({
+        uid: "1933865292 15918883740",
+        turnstileToken: "unused",
+        collectId: "collect_1234567890abcdef1234567890abcdef",
+        collectToken: "unused",
+      }),
     }),
     env,
     createCtx(),
@@ -256,11 +320,17 @@ test("POST /api/generate should rollback cooldown and return 503 when queue send
   };
 
   try {
+    const collect = await createReadyCollectSession(env, "223344");
     const createRequest = () =>
       new Request("https://rem.furry.ist/api/generate", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ uid: "223344", turnstileToken: "ok-token" }),
+        body: JSON.stringify({
+          uid: "223344",
+          turnstileToken: "ok-token",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+        }),
       });
 
     const firstResp = await runtime.fetch(createRequest(), env, createCtx());
@@ -272,6 +342,49 @@ test("POST /api/generate should rollback cooldown and return 503 when queue send
     assert.equal(secondResp.status, 202);
     const secondBody = await secondResp.json();
     assert.equal(secondBody.queued, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("POST /api/generate should return 409 when collect session not ready", async () => {
+  const env = createEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    throw new Error(`unexpected fetch ${String(url)}`);
+  };
+  try {
+    const collectResp = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/collect/init", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uid: "998877", turnstileToken: "ok-token" }),
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(collectResp.status, 200);
+    const collect = await collectResp.json();
+
+    const response = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          uid: "998877",
+          turnstileToken: "ok-token",
+          collectId: collect.collectId,
+          collectToken: collect.collectToken,
+        }),
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(response.status, 409);
+    assert.equal(env.__queueMessages.length, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }

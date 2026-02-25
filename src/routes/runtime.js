@@ -1269,8 +1269,27 @@ async function handleUploadComplete(request, env) {
 async function handleGenerate(request, env, ctx) {
   const body = await request.json().catch(() => ({}));
   const uid = parseSingleUidOrThrow(body.uid);
+  const collectId = normalizeCollectId(body.collectId);
+  const collectToken = String(body.collectToken || "").trim();
+  if (!collectId) throw new HttpError(400, "collectId 不合法");
+  if (!collectToken) throw new HttpError(400, "collectToken 必填");
   await verifyTurnstile(request, env, body.turnstileToken);
   await enforceIpRateLimit(env, request, "generate", 10, 4);
+
+  const collectPayload = await verifySignedToken(env, collectToken);
+  if (!collectPayload || collectPayload.scope !== "collect" || collectPayload.collectId !== collectId || collectPayload.uid !== uid) {
+    throw new HttpError(403, "collectToken 无效");
+  }
+  const collectSession = await env.REMEMBER_KV.get(`collect:${collectId}`, "json");
+  if (!collectSession || collectSession.uid !== uid) throw new HttpError(403, "采集会话无效");
+  const requiredArtifacts = Array.isArray(collectSession.requiredArtifacts) && collectSession.requiredArtifacts.length > 0
+    ? collectSession.requiredArtifacts
+    : [...COLLECT_REQUIRED_ARTIFACTS];
+  const uploadedArtifacts = collectSession.uploadedArtifacts && typeof collectSession.uploadedArtifacts === "object"
+    ? collectSession.uploadedArtifacts
+    : {};
+  const isReady = String(collectSession.status || "") === "ready" && requiredArtifacts.every((name) => Boolean(uploadedArtifacts[name]));
+  if (!isReady) throw new HttpError(409, "采集尚未完成，请先完成上传后再生成");
 
   const cooldownKey = `cooldown:uid:${uid}`;
   const existingCooldown = await env.REMEMBER_KV.get(cooldownKey);
@@ -1287,6 +1306,7 @@ async function handleGenerate(request, env, ctx) {
   const job = {
     jobId,
     uid,
+    collectId,
     status: "queued",
     stage: "queued",
     progress: 0,
@@ -1301,6 +1321,7 @@ async function handleGenerate(request, env, ctx) {
       JSON.stringify({
         jobId,
         uid,
+        collectId,
         requestedAt: now,
         traceId,
       }),
