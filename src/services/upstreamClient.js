@@ -2,6 +2,28 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeRatio(value, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(1, n));
+}
+
+function parseRetryAfterMs(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) return Math.max(0, Number(raw) * 1000);
+  const when = Date.parse(raw);
+  if (!Number.isFinite(when)) return null;
+  return Math.max(0, when - Date.now());
+}
+
+function computeBackoffDelayMs(baseMs, attempt, maxBackoffMs, jitterRatio) {
+  const exp = Math.min(maxBackoffMs, baseMs * (2 ** attempt));
+  const jitterWindow = exp * jitterRatio;
+  const jitter = (Math.random() * 2 - 1) * jitterWindow;
+  return Math.max(0, Math.round(exp + jitter));
+}
+
 class Semaphore {
   constructor(max) {
     this.max = Math.max(1, Number(max) || 1);
@@ -67,6 +89,8 @@ export class UpstreamClient {
     this.timeoutMs = Math.max(100, Number(options.timeoutMs) || 6000);
     this.retries = Math.max(0, Number(options.retries) || 2);
     this.backoffBaseMs = Math.max(50, Number(options.backoffBaseMs) || 300);
+    this.maxBackoffMs = Math.max(this.backoffBaseMs, Number(options.maxBackoffMs) || 4000);
+    this.backoffJitterRatio = normalizeRatio(options.backoffJitterRatio, 0.2);
     this.fetchImpl = options.fetchImpl || fetch;
     this.semaphore = new Semaphore(options.maxConcurrency || 4);
   }
@@ -91,7 +115,16 @@ export class UpstreamClient {
     const parsed = this.assertUrlAllowed(url);
     const maxRetries = options.retries ?? this.retries;
     const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    const backoffBaseMs = Math.max(50, Number(options.backoffBaseMs ?? this.backoffBaseMs) || this.backoffBaseMs);
+    const maxBackoffMs = Math.max(backoffBaseMs, Number(options.maxBackoffMs ?? this.maxBackoffMs) || this.maxBackoffMs);
+    const backoffJitterRatio = normalizeRatio(options.backoffJitterRatio ?? this.backoffJitterRatio, this.backoffJitterRatio);
     const schema = options.schema || null;
+    const retryDelay = async (attempt, retryAfterMs = null) => {
+      const delayMs = Number.isFinite(retryAfterMs)
+        ? Math.min(maxBackoffMs, Math.max(0, Number(retryAfterMs)))
+        : computeBackoffDelayMs(backoffBaseMs, attempt, maxBackoffMs, backoffJitterRatio);
+      await sleep(delayMs);
+    };
 
     await this.semaphore.acquire();
     try {
@@ -109,7 +142,8 @@ export class UpstreamClient {
           const text = await response.text();
           if (!response.ok) {
             if (attempt < maxRetries && isRetryableStatus(response.status)) {
-              await sleep(this.backoffBaseMs * (attempt + 1));
+              const retryAfterMs = parseRetryAfterMs(response.headers?.get("retry-after"));
+              await retryDelay(attempt, retryAfterMs);
               continue;
             }
             throw new UpstreamError("上游请求失败", {
@@ -131,20 +165,20 @@ export class UpstreamClient {
         } catch (err) {
           if (isAbortError(err)) {
             if (attempt < maxRetries) {
-              await sleep(this.backoffBaseMs * (attempt + 1));
+              await retryDelay(attempt);
               continue;
             }
             throw new UpstreamTimeoutError("上游请求超时", { timeoutMs, url: parsed.toString() });
           }
           if (err instanceof UpstreamError) {
             if (attempt < maxRetries && isRetryableUpstreamError(err)) {
-              await sleep(this.backoffBaseMs * (attempt + 1));
+              await retryDelay(attempt);
               continue;
             }
             throw err;
           }
           if (attempt < maxRetries) {
-            await sleep(this.backoffBaseMs * (attempt + 1));
+            await retryDelay(attempt);
             continue;
           }
           throw new UpstreamError("上游请求异常", { message: String(err?.message || err), url: parsed.toString() });
@@ -162,9 +196,11 @@ export class UpstreamClient {
 export function createDefaultUpstreamClient(fetchImpl = fetch) {
   return new UpstreamClient({
     fetchImpl,
-    timeoutMs: 8000,
-    retries: 2,
-    backoffBaseMs: 250,
+    timeoutMs: 10000,
+    retries: 4,
+    backoffBaseMs: 300,
+    maxBackoffMs: 6000,
+    backoffJitterRatio: 0.25,
     maxConcurrency: 4,
     allowedHosts: ["uapis.cn", "api.aicu.cc", "grok.726748.xyz", "api.github.com"],
   });

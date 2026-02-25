@@ -587,11 +587,13 @@ function homepageHtml(siteKey, scriptNonce = "") {
   }
 
   async function fetchAllVidWithRetry(uid){
+    const maxDirectAttempts=5;
+    const directTimeoutMs=5000;
     const directUrl='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(uid)+'&ps=1&pn=1';
     let lastError='未知错误';
-    for(let attempt=1;attempt<=3;attempt++){
+    for(let attempt=1;attempt<=maxDirectAttempts;attempt++){
       const controller=new AbortController();
-      const timer=setTimeout(()=>controller.abort(),4000);
+      const timer=setTimeout(()=>controller.abort(),directTimeoutMs);
       try{
         const resp=await fetch(directUrl,{signal:controller.signal,headers:{accept:'application/json'}});
         if(!resp.ok) throw new Error('HTTP '+resp.status);
@@ -600,16 +602,24 @@ function homepageHtml(siteKey, scriptNonce = "") {
         return {via:'direct',attempt,data};
       }catch(err){
         lastError=String(err&&err.message?err.message:err);
-        await sleep(200*attempt);
+        const delay=Math.min(1800,250*(2**Math.max(0,attempt-1)));
+        await sleep(delay);
       }finally{
         clearTimeout(timer);
       }
     }
-    const proxyResp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
-    if(!proxyResp.ok){
-      throw new Error('代理请求失败 HTTP '+proxyResp.status+'; direct error: '+lastError);
+    let proxyLastError='未知错误';
+    for(let proxyAttempt=1;proxyAttempt<=2;proxyAttempt++){
+      try{
+        const proxyResp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
+        if(!proxyResp.ok) throw new Error('HTTP '+proxyResp.status);
+        return {via:'worker-proxy',attempt:maxDirectAttempts+proxyAttempt,data:await proxyResp.json(),fallback:lastError};
+      }catch(err){
+        proxyLastError=String(err&&err.message?err.message:err);
+        await sleep(400*proxyAttempt);
+      }
     }
-    return {via:'worker-proxy',attempt:4,data:await proxyResp.json(),fallback:lastError};
+    throw new Error('代理请求失败 '+proxyLastError+'; direct error: '+lastError);
   }
 
   async function pollJob(jobId){
@@ -663,7 +673,7 @@ function homepageHtml(siteKey, scriptNonce = "") {
       if(source.via==='direct'){
         sourceHint.textContent='上游直连成功（'+source.attempt+' 次尝试）';
       }else{
-        sourceHint.textContent='上游直连失败 3 次，已切换 Worker 代理。';
+        sourceHint.textContent='上游直连失败 5 次，已切换 Worker 代理。';
       }
       const turnstileToken=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
       const resp=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken})});
@@ -759,20 +769,54 @@ async function processGenerateJob(env, jobId) {
 
   await patchJob({ status: "running", stage: "fetching", progress: 10 });
   try {
-    const [uploadsRaw, allVid, comments, danmu, liveDanmu] = await Promise.all([
+    const safeFetch = async (task, fallbackValue, label) => {
+      try {
+        return { value: await task(), warning: null };
+      } catch (err) {
+        const reason = sanitizeFailureMessage(err?.message || err);
+        return { value: fallbackValue, warning: `${label}抓取失败，已降级：${reason}` };
+      }
+    };
+    const [uploadsRaw, allVidResult, commentsResult, danmuResult, liveDanmuResult] = await Promise.all([
       env.REMEMBER_KV.get(`uploads:index:${uid}`, "json"),
-      fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 }),
-      fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 }),
-      fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 }),
-      fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 }),
+      safeFetch(
+        () => fetchAllVideosByUid(upstreamClient, uid, { maxPages: 200, pageSize: 50 }),
+        { uid, total: 0, fetchedPages: 0, videos: [] },
+        "视频列表",
+      ),
+      safeFetch(
+        () => fetchPagedAicuData(upstreamClient, "comment", uid, { maxPages: 200, maxItems: 1000 }),
+        { uid, source: "comment", total: 0, fetchedPages: 0, truncated: false, items: [] },
+        "评论",
+      ),
+      safeFetch(
+        () => fetchPagedAicuData(upstreamClient, "danmu", uid, { maxPages: 200, maxItems: 1000 }),
+        { uid, source: "danmu", total: 0, fetchedPages: 0, truncated: false, items: [] },
+        "弹幕",
+      ),
+      safeFetch(
+        () => fetchPagedAicuData(upstreamClient, "zhibodanmu", uid, { maxPages: 200, maxItems: 500 }),
+        { uid, source: "zhibodanmu", total: 0, fetchedPages: 0, truncated: false, items: [] },
+        "直播弹幕",
+      ),
     ]);
+    const allVid = allVidResult.value;
+    const comments = commentsResult.value;
+    const danmu = danmuResult.value;
+    const liveDanmu = liveDanmuResult.value;
+    const topVideoInfosResult = await safeFetch(
+      () => fetchTopVideoInfosByPlayCount(upstreamClient, allVid.videos || [], { topN: 10, concurrency: 3 }),
+      [],
+      "视频详情",
+    );
     const uploads = Array.isArray(uploadsRaw) ? uploadsRaw : [];
-    const topVideoInfos = await fetchTopVideoInfosByPlayCount(upstreamClient, allVid.videos || [], { topN: 10, concurrency: 3 });
+    const topVideoInfos = topVideoInfosResult.value;
     const regDateEstimate = estimateRegDateByUid(uid);
     const dataNotice = String(env.DATA_NOTICE || "第三方API数据可能不准确，仅供纪念参考");
     const generatedAt = Date.now();
+    const warnings = [allVidResult.warning, commentsResult.warning, danmuResult.warning, liveDanmuResult.warning, topVideoInfosResult.warning].filter(Boolean);
 
-    await patchJob({ stage: "analyzing", progress: 60 });
+    await patchJob({ stage: "analyzing", progress: 60, warnings });
     const snapshotBase = {
       uid,
       uploads,
@@ -788,7 +832,6 @@ async function processGenerateJob(env, jobId) {
       regDateEstimate,
     };
     const modelOutput = await analyzeWithGrok(env, upstreamClient, snapshotBase);
-    const warnings = [];
     if (modelOutput?.source === "fallback" && modelOutput?.reason) {
       warnings.push(String(modelOutput.reason));
     }
@@ -843,6 +886,25 @@ function proxySchemaValidator(source, payload) {
   return Array.isArray(list) || Number.isFinite(Number(payload.code ?? 0));
 }
 
+function proxyRetryOptions(source) {
+  if (source === "allVid" || source === "vidInfo") {
+    return {
+      retries: 4,
+      timeoutMs: 10000,
+      backoffBaseMs: 250,
+      maxBackoffMs: 5000,
+      backoffJitterRatio: 0.2,
+    };
+  }
+  return {
+    retries: 5,
+    timeoutMs: 12000,
+    backoffBaseMs: 300,
+    maxBackoffMs: 6000,
+    backoffJitterRatio: 0.25,
+  };
+}
+
 async function handleProxy(request, env, url) {
   await enforceIpRateLimit(env, request, "proxy", 120, 30);
   const source = url.pathname.split("/").pop();
@@ -883,6 +945,7 @@ async function handleProxy(request, env, url) {
   let payload;
   try {
     const { data } = await upstreamClient.requestJson(upstream, {
+      ...proxyRetryOptions(source),
       schema: (data) => proxySchemaValidator(source, data),
     });
     payload = data;

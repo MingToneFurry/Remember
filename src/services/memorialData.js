@@ -9,6 +9,30 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+const ARCHIVE_RETRY_OPTIONS = {
+  retries: 4,
+  timeoutMs: 10000,
+  backoffBaseMs: 250,
+  maxBackoffMs: 5000,
+  backoffJitterRatio: 0.2,
+};
+
+const AICU_RETRY_OPTIONS = {
+  retries: 5,
+  timeoutMs: 12000,
+  backoffBaseMs: 300,
+  maxBackoffMs: 6000,
+  backoffJitterRatio: 0.25,
+};
+
+const VIDEO_VIEW_RETRY_OPTIONS = {
+  retries: 4,
+  timeoutMs: 10000,
+  backoffBaseMs: 250,
+  maxBackoffMs: 5000,
+  backoffJitterRatio: 0.2,
+};
+
 export async function fetchAllVideosByUid(client, uid, options = {}) {
   const maxPages = Math.max(1, Number(options.maxPages) || 200);
   const pageSize = Math.max(1, Math.min(50, Number(options.pageSize) || 50));
@@ -19,6 +43,7 @@ export async function fetchAllVideosByUid(client, uid, options = {}) {
   while (page <= maxPages) {
     const url = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=${pageSize}&pn=${page}`;
     const { data } = await client.requestJson(url, {
+      ...ARCHIVE_RETRY_OPTIONS,
       schema: (payload) => payload && typeof payload === "object",
     });
 
@@ -50,19 +75,19 @@ async function fetchAicuByPage(client, source, uid, page, keyword = "") {
   if (source === "comment") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&mode=0`,
-      { schema: (payload) => payload && typeof payload === "object" },
+      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
     );
   }
   if (source === "danmu") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`,
-      { schema: (payload) => payload && typeof payload === "object" },
+      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
     );
   }
   if (source === "zhibodanmu") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`,
-      { schema: (payload) => payload && typeof payload === "object" },
+      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
     );
   }
   throw new UpstreamError("未知的 AICU 数据源", { source });
@@ -193,6 +218,7 @@ export async function fetchTopVideoInfosByPlayCount(client, videos, options = {}
     if (!bvid && !aid) return null;
     const query = bvid ? `bvid=${encodeURIComponent(bvid)}` : `aid=${encodeURIComponent(aid)}`;
     const { data } = await client.requestJson(`https://uapis.cn/api/v1/social/bilibili/view?${query}`, {
+      ...VIDEO_VIEW_RETRY_OPTIONS,
       schema: (payload) => payload && typeof payload === "object",
     });
     return {
