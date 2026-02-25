@@ -1,299 +1,321 @@
-# Remember 详细部署文档
+# Remember 部署文档（Cloudflare + 自动部署）
 
-最后更新：2026-02-24
+最后更新：2026-02-25
 
-## 1. 部署目标
+## 1. 你要的两种自动部署方式
 
-将 `Remember` 以 Cloudflare Workers 的形式部署到生产域名 `rem.furry.ist`，并正确接入：
+本项目支持两种自动部署路径：
 
-- Workers 路由
-- R2（对象存储）
-- KV（元数据/任务状态）
-- Turnstile（人机验证）
-- Cloudflare Access（管理接口鉴权）
+1. `GitHub Actions`（仓库内执行 `wrangler deploy`）
+2. `Cloudflare Workers Git 集成（Workers Builds）`（Cloudflare 直接连 GitHub/GitLab）
 
-## 2. 前置条件
+建议先确定主路径，再启用，避免双重部署互相覆盖。
 
-执行部署前请确认：
+### 1.1 方案选择建议
 
-- 已有 Cloudflare 账号，且站点 `furry.ist` 已接入 Cloudflare
-- 本地已安装 Node.js（建议 20+）
-- 本地可用 `npx wrangler`（建议 4.x）
-- 具备以下 Cloudflare 权限：Workers、KV、R2、Zero Trust Access、Turnstile
+- 选 `GitHub Actions`：
+  - 你希望部署逻辑和校验步骤全部在仓库可审计（YAML 可评审）。
+  - 你需要在部署后执行额外动作（例如 purge cache、自定义脚本）。
+- 选 `Workers Git 集成`：
+  - 你希望 Cloudflare 原生托管构建和部署，不维护太多 CI 细节。
+  - 你希望 PR/提交状态直接显示在 Git 提供商集成里。
 
-快速检查：
+### 1.2 不建议同时启用同一分支自动部署
+
+如果两个系统都监听同一个代码分支，会出现重复部署。建议：
+
+- 只保留一个“生产 Worker 部署入口”；
+- 另一个仅用于辅助（例如只做测试，不做 deploy）。
+
+---
+
+## 2. Cloudflare 详细部署（通用基础）
+
+不管你选哪条自动部署路径，先完成以下基础配置。
+
+## 2.1 前置条件
+
+- Cloudflare 账号已接入站点 `furry.ist`
+- 本地 Node.js >= 20
+- Wrangler 4.x 可用
 
 ```bash
 node -v
 npx wrangler --version
-```
-
-首次使用 Wrangler 需要登录：
-
-```bash
 npx wrangler login
 ```
 
-## 3. 创建云端资源
+## 2.2 创建云端资源
 
-### 3.1 创建 KV Namespace
+### 2.2.1 KV
 
 ```bash
 npx wrangler kv namespace create REMEMBER_KV
 ```
 
-记录命令输出里的 `id`，稍后填入 `wrangler.toml`。
+记录返回的 `id`，稍后填入 `wrangler.toml`。
 
-### 3.2 创建 R2 Bucket
+### 2.2.2 R2
 
 ```bash
 npx wrangler r2 bucket create remember-data
 ```
 
-### 3.3 创建 Turnstile 站点
+### 2.2.3 Queue
+
+```bash
+npx wrangler queues create remember-analysis
+```
+
+### 2.2.4 Turnstile
 
 在 Cloudflare Dashboard 创建 Turnstile Site：
 
-- Hostname 建议包含 `rem.furry.ist`
-- 记录 `Site Key` 和 `Secret Key`
+- Hostname 包含 `rem.furry.ist`
+- 记录 `Site Key` 与 `Secret Key`
 
-后续：
+### 2.2.5 Cloudflare Access（保护管理接口）
 
-- `TURNSTILE_SITE_KEY` 写入 `wrangler.toml`（变量）
-- `TURNSTILE_SECRET` 通过 `wrangler secret put` 注入（密钥）
-
-### 3.4 创建 Cloudflare Access 应用
-
-在 Zero Trust 中创建 Self-hosted 应用，保护：
+在 Zero Trust 创建 Self-hosted 应用，覆盖路径：
 
 - `/admin*`
 - `/api/admin/*`
 
-建议策略：
+创建策略后复制 `AUD`（JWT aud claim），写入 `ACCESS_AUD`。
 
-- 仅允许指定邮箱、邮箱域、或特定身份组
-- 默认拒绝其他访问
+## 2.3 配置 `wrangler.toml`
 
-从应用详情中复制 `AUD`（JWT aud claim），后续写入 `ACCESS_AUD`。
-
-## 4. 配置 `wrangler.toml`
-
-当前项目使用：
-
-- 默认环境用于本地开发
-- `env.production` 用于生产路由与生产绑定
-
-你需要至少完成这些替换：
+必须确认以下内容与云端资源一致：
 
 - `[[kv_namespaces]].id`
 - `[[env.production.kv_namespaces]].id`
-- `[vars].TURNSTILE_SITE_KEY`
-- `[env.production.vars].TURNSTILE_SITE_KEY`
-- `[vars].ACCESS_AUD`
-- `[env.production.vars].ACCESS_AUD`
+- `[[r2_buckets]].bucket_name`
+- `[[queues.producers]].queue`
+- `[[queues.consumers]].queue`
+- `[env.production].routes`
+- `[vars]/[env.production.vars]` 中 `TURNSTILE_SITE_KEY`、`ACCESS_AUD`
 
-参考结构（以仓库文件为准）：
+当前项目关键项示例（以仓库文件为准）：
 
 ```toml
 name = "remember-pages"
 main = "workers.js"
 compatibility_date = "2026-01-15"
-workers_dev = true
 
-[vars]
-TURNSTILE_SITE_KEY = "<site-key>"
-ACCESS_AUD = "<access-aud>"
+[[queues.producers]]
+binding = "ANALYSIS_QUEUE"
+queue = "remember-analysis"
 
-[[r2_buckets]]
-binding = "REMEMBER_DATA"
-bucket_name = "remember-data"
-
-[[kv_namespaces]]
-binding = "REMEMBER_KV"
-id = "<kv-id>"
+[[queues.consumers]]
+queue = "remember-analysis"
+max_batch_size = 1
+max_batch_timeout = 3
 
 [env.production]
 routes = [{ pattern = "rem.furry.ist/*", zone_name = "furry.ist" }]
-
-[env.production.vars]
-TURNSTILE_SITE_KEY = "<site-key>"
-ACCESS_AUD = "<access-aud>"
-
-[[env.production.r2_buckets]]
-binding = "REMEMBER_DATA"
-bucket_name = "remember-data"
-
-[[env.production.kv_namespaces]]
-binding = "REMEMBER_KV"
-id = "<kv-id>"
 ```
 
-如果有多个 Access AUD，可用逗号拼接：
-
-```toml
-ACCESS_AUD = "aud1,aud2,aud3"
-```
-
-## 5. 注入密钥（Secrets）
-
-### 5.1 生成上传签名密钥
-
-可用 Node 生成 32 字节随机值：
-
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-```
-
-### 5.2 写入生产 Secrets
+## 2.4 注入生产 Secrets（Cloudflare）
 
 ```bash
 npx wrangler secret put TURNSTILE_SECRET --env production
 npx wrangler secret put TOKEN_SIGNING_SECRET --env production
+npx wrangler secret put GROK_API_KEY --env production
+npx wrangler secret put GITHUB_TOKEN --env production
 ```
 
-注意：
-
-- `TOKEN_SIGNING_SECRET` 需足够随机，且长度建议不低于 32 字节
-- 不要把 secret 直接写入 `wrangler.toml`
-
-## 6. 本地联调
+可选（未设置则由代码走默认/回退逻辑）：
 
 ```bash
-npx wrangler dev
+npx wrangler secret put GITHUB_OWNER --env production
+npx wrangler secret put GITHUB_REPO --env production
 ```
 
-联调建议：
-
-- 先验证 `GET /`、`GET /api/recent`
-- 再验证 `POST /api/generate` 和任务轮询
-- 管理接口在本地默认不会有 Access 头，返回 403 属于预期
-
-## 7. 发布前检查
-
-### 7.1 语法检查
+## 2.5 发布前本地校验
 
 ```bash
-node --check workers.js
+npm run check
+npm run test
+npm run perf
+npm run dryrun
 ```
 
-### 7.2 生产 dry-run
+---
+
+## 3. 方案 A：GitHub Actions 自动部署（推荐当前仓库继续使用）
+
+本仓库已有 workflow：
+
+- 文件：`.github/workflows/deploy-generated-pages.yml`
+- 触发：`generated-pages` 分支下 `generated/**` 变更
+- 行为：`check -> test -> wrangler deploy -> purge changed URLs`
+
+## 3.1 GitHub Secrets 配置
+
+在 GitHub 仓库 `Settings -> Secrets and variables -> Actions` 添加：
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_ZONE_ID`
+
+## 3.2 API Token 最小权限建议
+
+`CLOUDFLARE_API_TOKEN` 建议至少具备：
+
+- Account 级：
+  - `Workers Scripts: Edit`
+  - `Workers KV Storage: Edit`
+  - `Workers R2 Storage: Edit`
+  - `Account Settings: Read`
+  - 若涉及 Queue 绑定变更，建议补 `Queues: Edit`
+- Zone 级：
+  - `Workers Routes: Edit`
+  - `Cache Purge`
+
+并把 token 资源范围限制到生产账户与生产 zone。
+
+## 3.3 触发与发布流
+
+1. Worker 内将产物提交到 `generated-pages` 分支（`generated/**`）。
+2. GitHub Action 被触发：
+   - 安装依赖
+   - `npm run check`
+   - `npm run test`
+   - `npx wrangler deploy --env production`
+   - 计算变更 URL 并调用 Cloudflare Cache Purge API
+3. 部署完成后访问线上域名验证。
+
+## 3.4 手动触发
+
+workflow 支持 `workflow_dispatch`，可在 GitHub Actions 页面手动触发一次部署。
+
+## 3.5 失败排查要点
+
+- `Authentication error`：检查 `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
+- `route permission denied`：补 `Workers Routes: Edit`
+- purge 失败：确认 `CLOUDFLARE_ZONE_ID` 与 `Cache Purge` 权限
+
+---
+
+## 4. 方案 B：Workers Git 集成自动部署（Workers Builds）
+
+适合希望 Cloudflare 直接托管部署流程的场景。
+
+## 4.1 创建或绑定 Git 集成
+
+1. 进入 `Cloudflare Dashboard -> Workers & Pages`
+2. 选择：
+   - 新建 Worker：`Create application -> Import a repository`
+   - 已有 Worker：进入 Worker 后 `Settings -> Builds` 绑定仓库
+3. 授权 `Cloudflare Workers and Pages` GitHub App（或 GitLab）
+4. 选择目标仓库与分支（通常是 `main`）
+
+## 4.2 构建与部署参数建议
+
+在 Builds 配置中设置：
+
+- Install command：`npm ci`（无 lockfile 可用 `npm install`）
+- Build/Check command：`npm run check && npm run test`
+- Deploy command：`npx wrangler deploy --env production`
+- Root directory：仓库根目录（若 monorepo 则填写子目录）
+- Watch paths（可选）：限制触发范围，避免无关改动触发部署
+
+## 4.3 环境变量与密钥
+
+在 Worker 的 `Settings -> Variables / Secrets` 中补齐与生产一致的配置：
+
+- Vars：`TURNSTILE_SITE_KEY`、`ACCESS_AUD`、`DATA_NOTICE` 等
+- Secrets：`TURNSTILE_SECRET`、`TOKEN_SIGNING_SECRET`、`GROK_API_KEY`、`GITHUB_TOKEN`
+
+## 4.4 与 GitHub Actions 共存时的规则
+
+若启用 Workers Git 集成部署 `main`，同时保留现有 `generated-pages` Action：
+
+- 可以共存（监听分支不同）
+- 但必须明确哪条链路负责“生产 Worker deploy”
+- 建议避免两条链路都部署同一个 Worker 同一环境
+
+---
+
+## 5. 手动部署（兜底）
+
+自动部署出现故障时，使用手动命令兜底：
 
 ```bash
-npx wrangler deploy --dry-run --env production
-```
-
-重点确认输出里存在以下绑定：
-
-- `env.REMEMBER_KV`
-- `env.REMEMBER_DATA`
-- `env.TURNSTILE_SITE_KEY`
-- `env.ACCESS_AUD`
-
-## 8. 正式发布
-
-```bash
+npm run check
+npm run test
+npm run perf
+npm run dryrun
 npx wrangler deploy --env production
 ```
 
-发布后建议记录：
+---
 
-- git commit hash
-- 发布时间
-- wrangler 输出摘要
+## 6. 上线后验收
 
-## 9. 上线验收清单
+1. `GET /` 可访问，Turnstile 正常
+2. `POST /api/generate` 可返回 `jobId`
+3. `GET /api/job/:jobId` 可看到阶段流转
+4. `GET /u/:uid` 页面可访问
+5. `GET /sitemap.xml` 与 `GET /robots.txt` 正常
+6. `/api/admin/*` 未授权访问返回 403
+7. GitHub Action 或 Workers Builds 有成功部署记录
 
-按顺序验证：
+---
 
-1. `GET /` 页面可访问，Turnstile 正常展示
-2. `GET /api/recent?limit=5` 正常返回 JSON
-3. 提交 UID 后 `POST /api/generate` 返回 `jobId`
-4. 轮询 `GET /api/job/:jobId` 最终为 `succeeded`
-5. `GET /u/:uid` 可访问
-6. `GET /sitemap.xml` 和 `GET /robots.txt` 正常
-7. 未通过 Access 访问 `/api/admin/requests` 返回 403
-8. 上传链路 `init/part/complete` 成功
+## 7. 回滚策略
 
-## 10. 定时清理任务（可选但建议）
+### 7.1 GitHub Actions 路径回滚
 
-项目已实现 `scheduled` 清理逻辑（R2 原始数据与过期上传会话），但需要触发器才能运行。
-
-可在 `wrangler.toml` 增加：
-
-```toml
-[env.production.triggers]
-crons = ["0 4 * * *"]
-```
-
-含义：每天 UTC 04:00 执行一次。
-
-## 11. 回滚方案
-
-推荐使用“回退代码 + 重新部署”：
+1. 回退到稳定 commit
+2. 推送分支触发重新部署，或手动 `workflow_dispatch`
 
 ```bash
-git checkout <上一个稳定commit>
+git checkout <stable-commit>
+git push origin HEAD:<deploy-branch>
+```
+
+### 7.2 Workers Git 集成路径回滚
+
+1. 在 Git 提供商回退分支到稳定 commit
+2. 触发一次新的构建部署
+
+### 7.3 紧急手动回滚
+
+```bash
+git checkout <stable-commit>
 npx wrangler deploy --env production
 ```
 
-回滚后做最小验收：
+---
 
-- `/`
-- `/api/recent`
-- `/u/:uid`
-- `/api/admin/requests`（未授权应 403）
+## 8. 常见问题
 
-## 12. 常见问题与排查
+### 8.1 `ACCESS_AUD not configured`
 
-### 12.1 `ACCESS_AUD not configured`
+- 原因：生产 vars 未配置或值为空
+- 处理：在 Cloudflare 生产环境 vars 补齐 `ACCESS_AUD`
 
-原因：
+### 8.2 管理接口始终 403
 
-- `wrangler.toml` 的 `ACCESS_AUD` 为空或未配置
+- 原因：Access 应用路径未覆盖 `/api/admin/*` 或策略未放行
+- 处理：检查 Access 应用路径、策略、AUD 一致性
 
-处理：
+### 8.3 `wrangler deploy` 权限错误
 
-- 在 `[env.production.vars]` 填入 Access 应用的 AUD
+- 原因：API token 权限不足
+- 处理：补齐 `Workers Scripts Edit / Workers Routes Edit / KV / R2 / Cache Purge` 等必要权限
 
-### 12.2 管理接口一直 403
+### 8.4 队列相关绑定报错
 
-原因：
+- 原因：Queue 名称或权限不匹配
+- 处理：核对 `wrangler.toml` 队列名与 Cloudflare 账户下队列一致，必要时补 `Queues Edit`
 
-- Access 应用未覆盖 `/api/admin/*`
-- Access 策略未放行当前用户
-- `ACCESS_AUD` 与实际应用不匹配
+---
 
-处理：
+## 9. 运维建议
 
-- 检查 Access 应用路径和策略
-- 重新确认 AUD 值
-
-### 12.3 上传完成失败（403/400）
-
-原因：
-
-- 上传 token 过期
-- `TOKEN_SIGNING_SECRET` 配置不一致
-- `parts` 列表不合法（重复 partNumber、缺失 etag）
-
-处理：
-
-- 重新走 `upload/init` 获取新 token
-- 检查生产 secret 是否被误改
-
-### 12.4 跨域请求失败
-
-原因：
-
-- 请求来源不在允许的 Origin 白名单
-
-处理：
-
-- 确认前端域名为 `https://rem.furry.ist` 或已纳入 Worker CORS 规则
-
-## 13. 运行维护建议
-
-- 每次发布前固定执行：`node --check` + `wrangler deploy --dry-run`
-- 对生产发布建立变更记录（时间、commit、发布人）
-- 周期性检查 KV/R2 资源使用量与错误日志
-- 对管理接口访问行为保留审计记录
+- 生产部署统一走一条主链路（Action 或 Git 集成），减少冲突
+- 所有 token 使用最小权限和最小资源范围
+- 每次部署记录：时间、commit hash、执行人、结果
+- 定期检查 KV/R2 用量、队列积压、5xx 错误趋势
