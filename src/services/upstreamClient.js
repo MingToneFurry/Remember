@@ -33,6 +33,12 @@ function isAbortError(err) {
   return err?.name === "AbortError";
 }
 
+function isRetryableUpstreamError(err) {
+  if (!(err instanceof UpstreamError)) return false;
+  const status = Number(err?.details?.status);
+  return Number.isFinite(status) && isRetryableStatus(status);
+}
+
 export class UpstreamError extends Error {
   constructor(message, details = {}) {
     super(message);
@@ -130,11 +136,17 @@ export class UpstreamClient {
             }
             throw new UpstreamTimeoutError("上游请求超时", { timeoutMs, url: parsed.toString() });
           }
+          if (err instanceof UpstreamError) {
+            if (attempt < maxRetries && isRetryableUpstreamError(err)) {
+              await sleep(this.backoffBaseMs * (attempt + 1));
+              continue;
+            }
+            throw err;
+          }
           if (attempt < maxRetries) {
             await sleep(this.backoffBaseMs * (attempt + 1));
             continue;
           }
-          if (err instanceof UpstreamError) throw err;
           throw new UpstreamError("上游请求异常", { message: String(err?.message || err), url: parsed.toString() });
         } finally {
           clearTimeout(timer);

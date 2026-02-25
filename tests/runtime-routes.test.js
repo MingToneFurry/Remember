@@ -87,6 +87,18 @@ function createCtx() {
   };
 }
 
+function createAsyncCtx() {
+  const tasks = [];
+  return {
+    waitUntil(task) {
+      tasks.push(Promise.resolve(task));
+    },
+    async flush() {
+      await Promise.all(tasks);
+    },
+  };
+}
+
 test("GET / should render nonce-based CSP and script nonce", async () => {
   const env = createEnv();
   const request = new Request("https://rem.furry.ist/", { method: "GET" });
@@ -221,4 +233,98 @@ test("unexpected server error should be redacted", async () => {
   }
   assert.equal(logged.some((line) => JSON.stringify(line).includes("leaked-value")), false);
   assert.equal(logged.some((line) => JSON.stringify(line).includes("[REDACTED]")), true);
+});
+
+test("queue should ack invalid payload and never retry", async () => {
+  const env = createEnv();
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: "{",
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  assert.equal(ackCount, 1);
+  assert.equal(retryCount, 0);
+});
+
+test("queue should stop retrying after max attempts", async () => {
+  const env = createEnv({
+    QUEUE_MAX_RETRIES: "2",
+    REMEMBER_KV: {
+      async get() {
+        throw new Error("temporary queue processing failure");
+      },
+      async put() {},
+      async delete() {},
+      async list() {
+        return { keys: [], list_complete: true };
+      },
+    },
+  });
+
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: JSON.stringify({ jobId: "job_1234567890abcdef1234567890abcdef", uid: "123456" }),
+    attempts: 2,
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  assert.equal(ackCount, 1);
+  assert.equal(retryCount, 0);
+});
+
+test("queue should retry when attempts are below max", async () => {
+  const env = createEnv({
+    QUEUE_MAX_RETRIES: "3",
+    REMEMBER_KV: {
+      async get() {
+        throw new Error("temporary queue processing failure");
+      },
+      async put() {},
+      async delete() {},
+      async list() {
+        return { keys: [], list_complete: true };
+      },
+    },
+  });
+
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: JSON.stringify({ jobId: "job_1234567890abcdef1234567890abcdef", uid: "123456" }),
+    attempts: 1,
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  assert.equal(ackCount, 0);
+  assert.equal(retryCount, 1);
 });

@@ -1197,19 +1197,60 @@ function parseQueueMessageBody(body) {
   return JSON.parse(String(body || "{}"));
 }
 
+function getQueueAttemptCount(message) {
+  const raw = Number(message?.attempts ?? message?.deliveryCount ?? message?.retryCount ?? 0);
+  return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+}
+
+async function markQueueJobFailed(env, jobId, error) {
+  const key = `job:${jobId}`;
+  const current = await env.REMEMBER_KV.get(key, "json").catch(() => null);
+  if (!current) return;
+  const safeMessage = sanitizeFailureMessage(error?.message || error);
+  const warnings = Array.isArray(current.warnings) ? current.warnings.slice(0, 5) : [];
+  warnings.push(`队列处理失败: ${safeMessage}`);
+  await env.REMEMBER_KV.put(
+    key,
+    JSON.stringify({
+      ...current,
+      status: "failed",
+      stage: "failed",
+      error: safeMessage,
+      warnings,
+      updatedAt: Date.now(),
+    }),
+    { expirationTtl: 24 * 3600 },
+  ).catch(() => {});
+}
+
 async function handleQueue(batch, env) {
+  const maxRetries = parseBoundedInt(env.QUEUE_MAX_RETRIES, 0, 10, 3);
   for (const message of batch.messages || []) {
+    let payload;
     try {
-      const payload = await parseQueueMessageBody(message.body);
-      const jobId = normalizeJobId(payload?.jobId);
-      const uid = normalizeUid(payload?.uid);
-      if (!jobId || !uid) {
-        if (typeof message.ack === "function") message.ack();
-        continue;
-      }
+      payload = await parseQueueMessageBody(message.body);
+    } catch {
+      if (typeof message.ack === "function") message.ack();
+      continue;
+    }
+
+    const jobId = normalizeJobId(payload?.jobId);
+    const uid = normalizeUid(payload?.uid);
+    if (!jobId || !uid) {
+      if (typeof message.ack === "function") message.ack();
+      continue;
+    }
+
+    try {
       await processGenerateJob(env, jobId);
       if (typeof message.ack === "function") message.ack();
     } catch (err) {
+      const attempts = getQueueAttemptCount(message);
+      if (attempts >= maxRetries) {
+        await markQueueJobFailed(env, jobId, err);
+        if (typeof message.ack === "function") message.ack();
+        continue;
+      }
       if (typeof message.retry === "function") {
         message.retry();
       } else if (typeof message.ack === "function") {

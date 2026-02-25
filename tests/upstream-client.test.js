@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { UpstreamClient, UpstreamTimeoutError } from "../src/services/upstreamClient.js";
+import { UpstreamClient, UpstreamError, UpstreamTimeoutError } from "../src/services/upstreamClient.js";
 
 function jsonResponse(status, data) {
   return new Response(JSON.stringify(data), {
@@ -51,4 +51,21 @@ test("should reject non-whitelisted hosts", async () => {
     fetchImpl: async () => jsonResponse(200, { ok: true }),
   });
   await assert.rejects(() => client.requestJson("https://example.com/api/test"), /白名单/);
+});
+
+test("should not retry non-retryable upstream status", async () => {
+  let attempts = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["uapis.cn"],
+    retries: 3,
+    timeoutMs: 100,
+    backoffBaseMs: 1,
+    fetchImpl: async () => {
+      attempts += 1;
+      return jsonResponse(400, { error: "bad request" });
+    },
+  });
+
+  await assert.rejects(() => client.requestJson("https://uapis.cn/api/test"), UpstreamError);
+  assert.equal(attempts, 1);
 });
