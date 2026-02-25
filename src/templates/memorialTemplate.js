@@ -4,6 +4,18 @@ function listOrEmpty(items, emptyHtml) {
   return items.length > 0 ? items.join("") : emptyHtml;
 }
 
+function buildVideoJumpUrl(video) {
+  const bvid = String(video?.bvid || video?.data?.bvid || "").trim();
+  if (/^BV[0-9A-Za-z]{10}$/.test(bvid)) return `https://b23.tv/${bvid}`;
+  const aid = String(video?.aid || video?.data?.aid || "").trim();
+  if (/^\d+$/.test(aid)) return `https://b23.tv/av${aid}`;
+  return "";
+}
+
+function pickCoverUrl(video) {
+  return String(video?.data?.cover || video?.data?.pic || video?.cover || "").trim();
+}
+
 export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
   const esc = typeof escapeHtml === "function" ? escapeHtml : (x) => String(x ?? "");
   const uploads = Array.isArray(snapshot?.uploads) ? snapshot.uploads : [];
@@ -28,12 +40,20 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
 
   const videoRows = listOrEmpty(
     topVideoInfos.slice(0, 10).map((v) => {
-      const title = esc(v?.data?.title || v?.bvid || "未命名视频");
+      const title = esc(v?.data?.title || v?.bvid || "?????");
       const bvid = esc(v?.bvid || v?.data?.bvid || "");
       const playCount = Number(v?.playCount || v?.data?.stat?.view || 0).toLocaleString();
-      return `<li><strong>${title}</strong>${bvid ? ` <code>${bvid}</code>` : ""} · 播放 ${playCount}</li>`;
+      const jumpUrl = buildVideoJumpUrl(v);
+      const coverUrl = pickCoverUrl(v);
+      const titleHtml = jumpUrl
+        ? `<a href="${esc(jumpUrl)}" target="_blank" rel="noopener noreferrer nofollow">${title}</a>`
+        : `<strong>${title}</strong>`;
+      const coverHtml = coverUrl
+        ? `<img class="video-cover" src="${esc(coverUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer"/>`
+        : "";
+      return `<li class="video-item">${coverHtml}<div class="video-meta">${titleHtml}${bvid ? ` <code>${bvid}</code>` : ""} ? ?? ${playCount}</div></li>`;
     }),
-    "<li>暂无视频信息</li>",
+    "<li>??????</li>",
   );
 
   const commentRows = listOrEmpty(
@@ -72,13 +92,18 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
     "<li>暂无采集告警</li>",
   );
 
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>UID ${esc(uid)} 纪念页</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>UID ${esc(uid)} 纪念页</title><meta name="viewport" content="width=device-width,initial-scale=1"/><meta name="referrer" content="no-referrer"/>
   <style>${buildSiteThemeCss()}
   .memorial-metrics{list-style:none;padding:0;margin:10px 0 0}
   .memorial-metrics li{padding:6px 0;border-bottom:1px solid var(--theme-line)}
   .memorial-metrics li:last-child{border-bottom:none}
   .memorial-list li{padding:6px 0;border-bottom:1px solid var(--theme-line)}
   .memorial-list li:last-child{border-bottom:none}
+  .video-item{display:flex;gap:10px;align-items:flex-start}
+  .video-meta{min-width:0}
+  .video-meta a{text-decoration:none;border-bottom:1px solid transparent}
+  .video-meta a:hover{border-bottom-color:var(--theme-accent);color:var(--theme-accent)}
+  .video-cover{width:84px;height:48px;object-fit:cover;border-radius:6px;border:1px solid var(--theme-line);background:var(--theme-card)}
   .notice-card{border:1px solid var(--theme-line);border-radius:10px;padding:10px 12px;background:var(--theme-card)}
   .fold{margin-top:12px}
   </style></head>

@@ -31,3 +31,30 @@ test("buildMemorialPage should escape user-controlled fields", () => {
   assert.equal(html.includes("<svg onload=alert(3)>"), false);
   assert.equal(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), true);
 });
+
+test("buildMemorialPage should render b23 links and no-referrer policies", () => {
+  const html = buildMemorialPage(
+    "456",
+    {
+      createdAt: Date.now(),
+      topVideoInfos: [
+        {
+          bvid: "BV1xx411c7Q1",
+          data: { title: "video-1", cover: "https://i0.hdslb.com/bfs/archive/cover.jpg", stat: { view: 100 } },
+          playCount: 100,
+        },
+        {
+          aid: "12345",
+          data: { title: "video-2", stat: { view: 50 } },
+          playCount: 50,
+        },
+      ],
+    },
+    esc,
+  );
+
+  assert.equal(html.includes("https://b23.tv/BV1xx411c7Q1"), true);
+  assert.equal(html.includes("https://b23.tv/av12345"), true);
+  assert.equal(html.includes('<meta name="referrer" content="no-referrer"/>'), true);
+  assert.equal(html.includes('referrerpolicy="no-referrer"'), true);
+});
