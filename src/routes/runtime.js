@@ -157,6 +157,11 @@ function normalizeCollectId(input) {
   return COLLECT_ID_REGEX.test(raw) ? raw : null;
 }
 
+function normalizeCollectArtifact(input) {
+  const raw = String(input || "").trim();
+  return COLLECT_REQUIRED_ARTIFACTS.includes(raw) ? raw : null;
+}
+
 function sanitizePublicDetails(details) {
   if (!Array.isArray(details)) return [];
   return details
@@ -1105,19 +1110,45 @@ async function handleCollectInit(request, env) {
 
 async function handleUploadInit(request, env) {
   const body = await request.json().catch(() => ({}));
-  const uid = parseSingleUidOrThrow(body.uid);
+  const collectId = normalizeCollectId(body.collectId);
+  const artifact = normalizeCollectArtifact(body.artifact);
+  if (!collectId) throw new HttpError(400, "collectId 不合法");
+  if (!artifact) throw new HttpError(400, "artifact 不合法");
   const size = Number(body.size || 0);
   if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_SIZE) throw new HttpError(400, "上传大小不合法");
-  await verifyTurnstile(request, env, body.turnstileToken);
   await enforceIpRateLimit(env, request, "upload-init", 20, 8);
 
-  const fileName = sanitizeFileName(body.fileName);
-  const mime = String(body.mime || "application/octet-stream").slice(0, 120);
-  const objectPath = `raw/${new Date().toISOString().slice(0, 10)}/${uid}/${randomId("upload")}-${fileName}`;
+  const collectToken = String(body.collectToken || body.sessionToken || "").trim();
+  const collectPayload = await verifySignedToken(env, collectToken);
+  if (!collectPayload || collectPayload.collectId !== collectId || collectPayload.scope !== "collect") {
+    throw new HttpError(403, "collectToken 无效");
+  }
+  const collectSession = await env.REMEMBER_KV.get(`collect:${collectId}`, "json");
+  if (!collectSession || collectSession.uid !== collectPayload.uid) throw new HttpError(403, "采集会话无效");
+  const uid = parseSingleUidOrThrow(body.uid || collectSession.uid);
+  if (uid !== collectSession.uid) throw new HttpError(400, "uid 与采集会话不一致");
+
+  const uploadedArtifacts = collectSession.uploadedArtifacts && typeof collectSession.uploadedArtifacts === "object" ? collectSession.uploadedArtifacts : {};
+  if (uploadedArtifacts[artifact]) throw new HttpError(409, `${artifact} 已上传完成`);
+  if (!["collecting", "ready"].includes(String(collectSession.status || ""))) {
+    throw new HttpError(409, "采集会话状态不允许上传");
+  }
+
+  const fileName = sanitizeFileName(body.fileName || `${artifact}.json`);
+  const mime = String(body.mime || "application/json").slice(0, 120);
+  const objectPath = `raw/${new Date().toISOString().slice(0, 10)}/${uid}/${collectId}/${artifact}.json`;
   const upload = await env.REMEMBER_DATA.createMultipartUpload(objectPath, { httpMetadata: { contentType: mime } });
-  const token = await issueSignedToken(env, { uid, uploadId: upload.uploadId }, 24 * 3600);
-  await env.REMEMBER_KV.put(`upload:${upload.uploadId}`, JSON.stringify({ uid, key: objectPath, fileName, mime, size, createdAt: Date.now() }), { expirationTtl: 24 * 3600 });
-  return jsonResponse({ ok: true, uid, uploadId: upload.uploadId, uploadToken: token, maxPartSizeHint: PART_SIZE_HINT }, 200, { "cache-control": "no-store" });
+  const token = await issueSignedToken(env, { uid, collectId, artifact, uploadId: upload.uploadId, scope: "upload" }, 2 * 3600);
+  await env.REMEMBER_KV.put(
+    `upload:${upload.uploadId}`,
+    JSON.stringify({ uid, collectId, artifact, key: objectPath, fileName, mime, size, createdAt: Date.now() }),
+    { expirationTtl: 24 * 3600 },
+  );
+  return jsonResponse(
+    { ok: true, uid, collectId, artifact, uploadId: upload.uploadId, uploadToken: token, maxPartSizeHint: PART_SIZE_HINT },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
 
 async function handleUploadPart(request, env, url) {
@@ -1127,12 +1158,17 @@ async function handleUploadPart(request, env, url) {
   await enforceIpRateLimit(env, request, "upload-part", UPLOAD_PART_LIMIT_PER_DAY, UPLOAD_PART_LIMIT_PER_MINUTE);
   const token = request.headers.get("x-upload-token") || request.headers.get("x-upload-session-token") || "";
   const payload = await verifySignedToken(env, token);
-  if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
+  if (!payload || payload.uploadId !== uploadId || payload.scope !== "upload") throw new HttpError(403, "上传令牌无效");
   const session = await env.REMEMBER_KV.get(`upload:${uploadId}`, "json");
-  if (!session || session.uid !== payload.uid) throw new HttpError(403, "上传会话无效");
+  if (!session || session.uid !== payload.uid || session.collectId !== payload.collectId || session.artifact !== payload.artifact) {
+    throw new HttpError(403, "上传会话无效");
+  }
+  const collectSession = await env.REMEMBER_KV.get(`collect:${session.collectId}`, "json");
+  if (!collectSession || collectSession.uid !== session.uid) throw new HttpError(403, "采集会话无效");
+  if (collectSession.uploadedArtifacts?.[session.artifact]) throw new HttpError(409, `${session.artifact} 已上传完成`);
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
   const p = await multipart.uploadPart(partNumber, request.body);
-  return jsonResponse({ ok: true, partNumber, etag: p.etag }, 200, { "cache-control": "no-store" });
+  return jsonResponse({ ok: true, partNumber, etag: p.etag, collectId: session.collectId, artifact: session.artifact }, 200, { "cache-control": "no-store" });
 }
 
 async function handleUploadComplete(request, env) {
@@ -1141,11 +1177,18 @@ async function handleUploadComplete(request, env) {
   const parts = Array.isArray(body.parts) ? body.parts : [];
   if (!uploadId || parts.length === 0) throw new HttpError(400, "参数不完整");
   await enforceIpRateLimit(env, request, "upload-complete", UPLOAD_COMPLETE_LIMIT_PER_DAY, UPLOAD_COMPLETE_LIMIT_PER_MINUTE);
-  await verifyTurnstile(request, env, body.turnstileToken);
   const payload = await verifySignedToken(env, body.uploadToken || body.sessionToken || "");
-  if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
+  if (!payload || payload.uploadId !== uploadId || payload.scope !== "upload") throw new HttpError(403, "上传令牌无效");
   const session = await env.REMEMBER_KV.get(`upload:${uploadId}`, "json");
-  if (!session) throw new HttpError(404, "上传会话不存在");
+  if (!session || session.uid !== payload.uid || session.collectId !== payload.collectId || session.artifact !== payload.artifact) {
+    throw new HttpError(404, "上传会话不存在");
+  }
+
+  const collectKey = `collect:${session.collectId}`;
+  const collectSession = await env.REMEMBER_KV.get(collectKey, "json");
+  if (!collectSession || collectSession.uid !== session.uid) throw new HttpError(403, "采集会话无效");
+  const existingArtifacts = collectSession.uploadedArtifacts && typeof collectSession.uploadedArtifacts === "object" ? collectSession.uploadedArtifacts : {};
+  if (existingArtifacts[session.artifact]) throw new HttpError(409, `${session.artifact} 已上传完成`);
 
   const normalizedParts = parts.map((x) => ({
     partNumber: Number(x.partNumber),
@@ -1164,15 +1207,65 @@ async function handleUploadComplete(request, env) {
 
   const multipart = env.REMEMBER_DATA.resumeMultipartUpload(session.key, uploadId);
   await multipart.complete(normalizedParts);
+
+  const uploadedArtifacts = { ...existingArtifacts };
+  uploadedArtifacts[session.artifact] = {
+    artifact: session.artifact,
+    key: session.key,
+    fileName: session.fileName,
+    mime: session.mime,
+    size: session.size,
+    uploadId,
+    uploadedAt: Date.now(),
+  };
+  const requiredArtifacts = Array.isArray(collectSession.requiredArtifacts) && collectSession.requiredArtifacts.length > 0
+    ? collectSession.requiredArtifacts
+    : [...COLLECT_REQUIRED_ARTIFACTS];
+  const collectStatus = requiredArtifacts.every((name) => Boolean(uploadedArtifacts[name])) ? "ready" : "collecting";
+  const totalBytes = Object.values(uploadedArtifacts).reduce((sum, item) => sum + Number(item?.size || 0), 0);
+  const nextCollect = {
+    ...collectSession,
+    uploadedArtifacts,
+    totalBytes,
+    status: collectStatus,
+    updatedAt: Date.now(),
+  };
+  const ttlSeconds = Math.max(
+    60,
+    Number.isFinite(Number(nextCollect.expiresAt))
+      ? Math.ceil(Math.max(0, Number(nextCollect.expiresAt) - Date.now()) / 1000)
+      : COLLECT_SESSION_TTL_SECONDS,
+  );
+  await env.REMEMBER_KV.put(collectKey, JSON.stringify(nextCollect), { expirationTtl: ttlSeconds });
+
   const idxKey = `uploads:index:${session.uid}`;
   // NOTE: KV does not provide atomic read-modify-write. This list is best-effort.
   const list = (await env.REMEMBER_KV.get(idxKey, "json")) || [];
-  list.push({ uploadId, key: session.key, fileName: session.fileName, mime: session.mime, size: session.size, createdAt: Date.now() });
+  list.push({
+    uploadId,
+    collectId: session.collectId,
+    artifact: session.artifact,
+    key: session.key,
+    fileName: session.fileName,
+    mime: session.mime,
+    size: session.size,
+    createdAt: Date.now(),
+  });
   await env.REMEMBER_KV.put(idxKey, JSON.stringify(list.slice(-200)));
   await env.REMEMBER_KV.delete(`upload:${uploadId}`);
-  return jsonResponse({ ok: true }, 200, { "cache-control": "no-store" });
+  return jsonResponse(
+    {
+      ok: true,
+      collectId: session.collectId,
+      artifact: session.artifact,
+      collectStatus,
+      uploadedCount: Object.keys(uploadedArtifacts).length,
+      requiredCount: requiredArtifacts.length,
+    },
+    200,
+    { "cache-control": "no-store" },
+  );
 }
-
 async function handleGenerate(request, env, ctx) {
   const body = await request.json().catch(() => ({}));
   const uid = parseSingleUidOrThrow(body.uid);
