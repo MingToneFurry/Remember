@@ -592,24 +592,51 @@ function homepageHtml(siteKey, scriptNonce = "") {
   }
 
   async function fetchAllVidWithRetry(uid){
-    const maxAttempts=5;
-    let lastError='未知错误';
-    for(let attempt=1;attempt<=maxAttempts;attempt++){
+    function isAllVidPayload(data){
+      if(!data||typeof data!=='object') return false;
+      const total=Number(data.total??data?.data?.total);
+      const hasTotal=Number.isFinite(total)&&total>=0;
+      const hasVideos=Array.isArray(data.videos)||Array.isArray(data?.data?.videos);
+      return hasTotal||hasVideos;
+    }
+    const maxDirectAttempts=5;
+    const directTimeoutMs=5000;
+    const directUrl='https://uapis.cn/api/v1/social/bilibili/archives?mid='+encodeURIComponent(uid)+'&ps=1&pn=1';
+    let directLastError='未知错误';
+    for(let attempt=1;attempt<=maxDirectAttempts;attempt++){
+      const controller=new AbortController();
+      const timer=setTimeout(()=>controller.abort(),directTimeoutMs);
       try{
-        const resp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
-        const payload=await resp.json().catch(()=>({}));
-        if(!resp.ok){
-          const detail=Array.isArray(payload.details)&&payload.details.length?(' - '+payload.details.join(' | ')):'';
-          throw new Error('HTTP '+resp.status+detail);
-        }
-        return {via:'worker-proxy',attempt,data:payload};
+        const resp=await fetch(directUrl,{signal:controller.signal,headers:{accept:'application/json'}});
+        if(!resp.ok) throw new Error('HTTP '+resp.status);
+        const data=await resp.json();
+        if(!isAllVidPayload(data)) throw new Error('payload invalid');
+        return {via:'direct',attempt,data};
       }catch(err){
-        lastError=String(err&&err.message?err.message:err);
+        directLastError=String(err&&err.message?err.message:err);
         const delay=Math.min(1800,250*(2**Math.max(0,attempt-1)));
         await sleep(delay);
+      }finally{
+        clearTimeout(timer);
       }
     }
-    throw new Error('代理请求失败 '+lastError);
+    let proxyLastError='未知错误';
+    for(let proxyAttempt=1;proxyAttempt<=3;proxyAttempt++){
+      try{
+        const proxyResp=await fetch('/api/proxy/allVid?uid='+encodeURIComponent(uid)+'&pn=1',{headers:{accept:'application/json'}});
+        const payload=await proxyResp.json().catch(()=>({}));
+        if(!proxyResp.ok){
+          const detail=Array.isArray(payload.details)&&payload.details.length?(' - '+payload.details.join(' | ')):'';
+          throw new Error('HTTP '+proxyResp.status+detail);
+        }
+        if(!isAllVidPayload(payload)) throw new Error('payload invalid');
+        return {via:'worker-proxy',attempt:maxDirectAttempts+proxyAttempt,data:payload,fallback:directLastError};
+      }catch(err){
+        proxyLastError=String(err&&err.message?err.message:err);
+        await sleep(400*proxyAttempt);
+      }
+    }
+    throw new Error('直连失败 '+directLastError+'；代理失败 '+proxyLastError);
   }
 
   async function pollJob(jobId){
@@ -660,7 +687,11 @@ function homepageHtml(siteKey, scriptNonce = "") {
       setStatus('检查数据源连通性');
       setStage('queued',0);
       const source=await fetchAllVidWithRetry(uid);
-      sourceHint.textContent='已通过 Worker 代理连通数据源（'+source.attempt+' 次尝试）。';
+      if(source.via==='direct'){
+        sourceHint.textContent='上游直连成功（'+source.attempt+' 次尝试）。';
+      }else{
+        sourceHint.textContent='上游直连失败，已回退 Worker 代理（第 '+source.attempt+' 次成功）。';
+      }
       const turnstileToken=window.turnstile&&typeof window.turnstile.getResponse==='function'?window.turnstile.getResponse():'';
       const resp=await fetch('/api/generate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({uid,turnstileToken})});
       const data=await resp.json();
