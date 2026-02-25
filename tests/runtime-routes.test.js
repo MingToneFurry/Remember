@@ -133,6 +133,48 @@ test("POST /api/generate should enqueue job and job endpoint should return stage
   }
 });
 
+test("POST /api/generate should rollback cooldown and return 503 when queue send fails", async () => {
+  let attempts = 0;
+  const env = createEnv({
+    ANALYSIS_QUEUE: {
+      async send() {
+        attempts += 1;
+        if (attempts === 1) {
+          throw new Error("queue down");
+        }
+      },
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    throw new Error(`unexpected fetch ${String(url)}`);
+  };
+
+  try {
+    const createRequest = () =>
+      new Request("https://rem.furry.ist/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uid: "223344", turnstileToken: "ok-token" }),
+      });
+
+    const firstResp = await runtime.fetch(createRequest(), env, createCtx());
+    assert.equal(firstResp.status, 503);
+    const firstBody = await firstResp.json();
+    assert.equal(firstBody.error, "服务暂时不可用");
+
+    const secondResp = await runtime.fetch(createRequest(), env, createCtx());
+    assert.equal(secondResp.status, 202);
+    const secondBody = await secondResp.json();
+    assert.equal(secondBody.queued, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("GET /api/job/:jobId should reject invalid id", async () => {
   const env = createEnv();
   const response = await runtime.fetch(new Request("https://rem.furry.ist/api/job/not-valid", { method: "GET" }), env, createCtx());
@@ -155,18 +197,28 @@ test("unexpected server error should be redacted", async () => {
     },
   });
 
-  const response = await runtime.fetch(
-    new Request("https://rem.furry.ist/api/job/job_1234567890abcdef1234567890abcdef", {
-      method: "GET",
-      headers: { "cf-ray": "ray-test-123" },
-    }),
-    env,
-    createCtx(),
-  );
-  assert.equal(response.status, 500);
-  const body = await response.json();
-  assert.equal(body.error, "Internal Error");
-  assert.deepEqual(body.details, []);
-  assert.equal(body.requestId, "ray-test-123");
+  const originalError = console.error;
+  const logged = [];
+  console.error = (...args) => {
+    logged.push(args);
+  };
+  try {
+    const response = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/job/job_1234567890abcdef1234567890abcdef", {
+        method: "GET",
+        headers: { "cf-ray": "ray-test-123" },
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(response.status, 500);
+    const body = await response.json();
+    assert.equal(body.error, "Internal Error");
+    assert.deepEqual(body.details, []);
+    assert.equal(body.requestId, "ray-test-123");
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(logged.some((line) => JSON.stringify(line).includes("leaked-value")), false);
+  assert.equal(logged.some((line) => JSON.stringify(line).includes("[REDACTED]")), true);
 });
-

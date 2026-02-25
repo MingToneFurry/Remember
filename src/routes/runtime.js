@@ -870,14 +870,19 @@ async function handleGenerate(request, env, ctx) {
     updatedAt: now,
   };
   await env.REMEMBER_KV.put(`job:${jobId}`, JSON.stringify(job), { expirationTtl: 24 * 3600 });
-  await env.ANALYSIS_QUEUE.send(
-    JSON.stringify({
-      jobId,
-      uid,
-      requestedAt: now,
-      traceId,
-    }),
-  );
+  try {
+    await env.ANALYSIS_QUEUE.send(
+      JSON.stringify({
+        jobId,
+        uid,
+        requestedAt: now,
+        traceId,
+      }),
+    );
+  } catch {
+    await Promise.allSettled([env.REMEMBER_KV.delete(`job:${jobId}`), env.REMEMBER_KV.delete(cooldownKey)]);
+    throw new HttpError(503, "排队服务暂时不可用，请稍后重试");
+  }
   return jsonResponse(
     {
       ok: true,
@@ -1150,7 +1155,7 @@ async function handleFetch(request, env, ctx) {
     throw new HttpError(404, "Not Found");
   } catch (err) {
     if (!(err instanceof HttpError)) {
-      console.error("unhandled_error", { requestId, path, message: String(err?.message || err) });
+      console.error("unhandled_error", { requestId, path, message: sanitizeFailureMessage(err?.message || err) });
     }
     const publicErr = publicErrorPayload(err, requestId);
     return jsonResponse(publicErr.body, publicErr.status, { ...cors, "cache-control": "no-store", "x-request-id": requestId });
