@@ -122,6 +122,8 @@ test("GET / should render warning script without innerHTML injection", async () 
   assert.equal(html.includes("warningList.innerHTML"), false);
   assert.equal(html.includes("warningList.replaceChildren()"), true);
   assert.equal(html.includes("li.textContent=String(warning)"), true);
+  assert.equal(html.includes("输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。"), false);
+  assert.equal(html.includes("remember-site-theme-v1"), true);
 });
 
 test("POST /api/generate should enqueue job and job endpoint should return stage/progress", async () => {
@@ -157,6 +159,80 @@ test("POST /api/generate should enqueue job and job endpoint should return stage
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("POST /api/generate should accept numeric UID samples", async () => {
+  const env = createEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    throw new Error(`unexpected fetch ${String(url)}`);
+  };
+
+  try {
+    for (const uid of ["1933865292", "15918883740"]) {
+      const response = await runtime.fetch(
+        new Request("https://rem.furry.ist/api/generate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ uid, turnstileToken: "ok-token" }),
+        }),
+        env,
+        createCtx(),
+      );
+      assert.equal(response.status, 202);
+    }
+    assert.equal(env.__queueMessages.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("POST /api/generate should normalize full-width uid input", async () => {
+  const env = createEnv();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/turnstile/v0/siteverify")) {
+      return jsonResponse(200, { success: true });
+    }
+    throw new Error(`unexpected fetch ${String(url)}`);
+  };
+
+  try {
+    const response = await runtime.fetch(
+      new Request("https://rem.furry.ist/api/generate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ uid: "１９３３８６５２９２", turnstileToken: "ok-token" }),
+      }),
+      env,
+      createCtx(),
+    );
+    assert.equal(response.status, 202);
+    assert.equal(env.__queueMessages.length, 1);
+    const payload = JSON.parse(env.__queueMessages[0]);
+    assert.equal(payload.uid, "1933865292");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("POST /api/generate should reject multi uid input", async () => {
+  const env = createEnv();
+  const response = await runtime.fetch(
+    new Request("https://rem.furry.ist/api/generate", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uid: "1933865292 15918883740", turnstileToken: "unused" }),
+    }),
+    env,
+    createCtx(),
+  );
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.match(String(body.error || ""), /仅支持单 UID/);
 });
 
 test("POST /api/generate should rollback cooldown and return 503 when queue send fails", async () => {

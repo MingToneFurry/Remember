@@ -3,6 +3,7 @@ import { analyzeWithGrok } from "../services/grokAnalyzer.js";
 import { syncGeneratedPageToGitHub } from "../services/githubSync.js";
 import { estimateRegDateByUid, fetchAllVideosByUid, fetchPagedAicuData, fetchTopVideoInfosByPlayCount } from "../services/memorialData.js";
 import { buildMemorialPage } from "../templates/memorialTemplate.js";
+import { buildSiteThemeCss } from "../templates/siteTheme.js";
 
 const DOMAIN = "https://rem.furry.ist";
 const MAX_UPLOAD_SIZE = 300 * 1024 * 1024;
@@ -22,6 +23,11 @@ const UPLOAD_PART_LIMIT_PER_DAY = 2000;
 const UPLOAD_PART_LIMIT_PER_MINUTE = 120;
 const UPLOAD_COMPLETE_LIMIT_PER_DAY = 200;
 const UPLOAD_COMPLETE_LIMIT_PER_MINUTE = 20;
+const UID_REGEX = /^\d{1,20}$/;
+const UID_SEGMENT_REGEX = /^\d+$/;
+const UID_ZERO_WIDTH_REGEX = /[\u200b-\u200d\u2060\ufeff]/g;
+const UID_EDGE_SEPARATOR_REGEX = /^[\s,，;；、|｜/\\`"'“”‘’()（）[\]{}<>《》【】]+|[\s,，;；、|｜/\\`"'“”‘’()（）[\]{}<>《》【】]+$/g;
+const UID_SPLIT_SEPARATOR_REGEX = /[,\s，;；、|｜/\\]+/;
 const upstreamClient = createDefaultUpstreamClient(fetch);
 const hotCache = {
   recent: { expiresAt: 0, items: [] },
@@ -88,7 +94,41 @@ function htmlResponse(html, status = 200, headers = {}, options = {}) {
 
 function normalizeUid(input) {
   const uid = String(input ?? "").trim();
-  return /^\d{1,20}$/.test(uid) ? uid : null;
+  return UID_REGEX.test(uid) ? uid : null;
+}
+
+function parseSingleUidInput(input) {
+  const normalized = String(input ?? "")
+    .normalize("NFKC")
+    .replace(UID_ZERO_WIDTH_REGEX, "")
+    .trim();
+  const cleaned = normalized.replace(UID_EDGE_SEPARATOR_REGEX, "");
+  if (!cleaned) return { uid: null, code: "invalid_uid" };
+  const segments = cleaned.split(UID_SPLIT_SEPARATOR_REGEX).filter(Boolean);
+  const numericSegments = segments.filter((segment) => UID_SEGMENT_REGEX.test(segment));
+  if (numericSegments.length > 1) return { uid: null, code: "multi_uid" };
+  if (UID_REGEX.test(cleaned)) return { uid: cleaned, code: "ok" };
+  return { uid: null, code: "invalid_uid" };
+}
+
+function parseSingleUidOrThrow(input) {
+  const parsed = parseSingleUidInput(input);
+  if (parsed.uid) return parsed.uid;
+  if (parsed.code === "multi_uid") {
+    throw new HttpError(400, "仅支持单 UID，请一次只输入一个 UID");
+  }
+  throw new HttpError(400, "uid 不合法");
+}
+
+function parseRequiredUidOrThrow(input, missingMessage = "uid 不合法") {
+  const raw = String(input ?? "").trim();
+  const parsed = parseSingleUidInput(input);
+  if (parsed.uid) return parsed.uid;
+  if (parsed.code === "multi_uid") {
+    throw new HttpError(400, "仅支持单 UID，请一次只输入一个 UID");
+  }
+  if (!raw) throw new HttpError(400, missingMessage);
+  throw new HttpError(400, "uid 不合法");
 }
 
 function safeText(value) {
@@ -423,41 +463,53 @@ function applyCorsToResponse(response, cors) {
 
 function homepageHtml(siteKey, scriptNonce = "") {
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Remember</title>
-  <style>
-  body{font-family:system-ui,-apple-system,sans-serif;background:#f4f7fc;padding:20px;color:#1f2a3d}
-  .box{max-width:980px;margin:0 auto;background:#fff;border:1px solid #dbe4f4;border-radius:12px;padding:18px}
-  form{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start}
-  input,button{padding:10px 12px;border-radius:8px;border:1px solid #c8d4eb}
-  button{background:#1c57d7;color:#fff;cursor:pointer}
-  button[disabled]{opacity:.65;cursor:not-allowed}
-  .full{grid-column:1 / -1}
-  .hint{font-size:12px;color:#4b5f87}
-  .status{margin-top:14px;padding:12px;border:1px solid #dbe4f5;border-radius:10px;background:#f8fbff}
-  .bar{height:8px;background:#e8eefb;border-radius:999px;overflow:hidden;margin-top:8px}
-  .bar > span{display:block;height:100%;background:#2d63d8;width:0;transition:width .2s ease}
-  .warn{color:#7a4e00;margin:10px 0 0;padding-left:18px}
-  .error{color:#a22121}
-  ul{padding-left:18px}
-  .recent{margin-top:16px}
+  <style>${buildSiteThemeCss()}
+  .home-form{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start}
+  .home-form .full{grid-column:1 / -1}
+  .status-box{margin-top:14px}
+  .progress-track{height:8px;background:var(--theme-card);border-radius:999px;overflow:hidden;margin-top:10px;border:1px solid var(--theme-line)}
+  .progress-track>span{display:block;height:100%;background:var(--theme-accent);width:0;transition:width var(--theme-motion) ease}
+  .warning-list{color:var(--theme-muted);margin:10px 0 0;padding-left:18px}
+  .error-text{margin-top:8px;color:var(--theme-danger)}
+  .recent-list li{padding:6px 0;border-bottom:1px solid var(--theme-line)}
+  .recent-list li:last-child{border-bottom:none}
+  .recent-list a{text-decoration:none;border-bottom:1px solid transparent;transition:border-color var(--theme-motion) ease,color var(--theme-motion) ease}
+  .recent-list a:hover{color:var(--theme-accent);border-bottom-color:var(--theme-accent)}
+  @media (max-width: 760px){.home-form{grid-template-columns:1fr}}
   </style>
-  <script nonce="${safeText(scriptNonce)}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body><div class="box">
-  <h1>Remember 纪念页生成</h1>
-  <p>输入 UID 创建异步任务。前端会先直连上游接口重试 3 次，全部失败后再走 Worker 代理。</p>
-  <form id="generate-form">
-    <input id="uid" inputmode="numeric" maxlength="20" placeholder="请输入 UID" autocomplete="off"/>
-    <button id="submit-btn" type="submit">创建任务</button>
-    <div class="cf-turnstile full" data-sitekey="${safeText(siteKey)}"></div>
-    <div id="source-hint" class="hint full"></div>
-  </form>
-  <div id="job-status" class="status">
-    <div id="status-line">等待提交任务</div>
-    <div id="stage-line" class="hint">阶段: -</div>
-    <div class="bar"><span id="progress-bar"></span></div>
-    <ul id="warning-list" class="warn"></ul>
-    <div id="error-line" class="error"></div>
-  </div>
-  <div class="recent"><h2>最近生成</h2><ul id="recent-list"></ul></div>
-  </div>
+  <script nonce="${safeText(scriptNonce)}" src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script></head><body>
+  <main class="site-shell">
+    <header class="hero">
+      <h1>记忆存档</h1>
+      <p class="lead">这些账号已注销。这里保存的是他们公开留下的片段。</p>
+      <p class="lead">仅展示用户自愿公开或平台允许保留的内容。</p>
+      <div class="meta-row">
+        <span class="meta-chip">存档会持续更新，保持克制呈现</span>
+      </div>
+    </header>
+
+    <section class="panel">
+      <h2>创建异步任务</h2>
+      <form id="generate-form" class="home-form">
+        <input id="uid" class="site-input" inputmode="numeric" maxlength="80" placeholder="请输入 UID" autocomplete="off"/>
+        <button id="submit-btn" class="site-button" type="submit">创建任务</button>
+        <div class="cf-turnstile full" data-sitekey="${safeText(siteKey)}"></div>
+        <div id="source-hint" class="hint full"></div>
+      </form>
+      <div id="job-status" class="status-box">
+        <div id="status-line">等待提交任务</div>
+        <div id="stage-line" class="hint">阶段: -</div>
+        <div class="progress-track"><span id="progress-bar"></span></div>
+        <ul id="warning-list" class="warning-list"></ul>
+        <div id="error-line" class="error-text"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>最近生成</h2>
+      <ul id="recent-list" class="recent-list"></ul>
+    </section>
+  </main>
   <script nonce="${safeText(scriptNonce)}">
   const STAGE_LABELS={queued:'排队中',fetching:'抓取数据',analyzing:'模型分析',rendering:'渲染页面',syncing:'同步产物',succeeded:'已完成',failed:'已失败'};
   const statusLine=document.getElementById('status-line');
@@ -485,6 +537,16 @@ function homepageHtml(siteKey, scriptNonce = "") {
       li.textContent=String(warning);
       warningList.appendChild(li);
     }
+  }
+  function parseSingleUidInput(input){
+    const normalized=String(input??'').normalize('NFKC').replace(/[\u200b-\u200d\u2060\ufeff]/g,'').trim();
+    const cleaned=normalized.replace(/^[\s,，;；、|｜/\\"'“”‘’()（）[\]{}<>《》【】]+|[\s,，;；、|｜/\\"'“”‘’()（）[\]{}<>《》【】]+$/g,'');
+    if(!cleaned) return {uid:null,code:'invalid_uid'};
+    const segments=cleaned.split(/[,\s，;；、|｜/\\]+/).filter(Boolean);
+    const numericSegments=segments.filter((segment)=>/^\d+$/.test(segment));
+    if(numericSegments.length>1) return {uid:null,code:'multi_uid'};
+    if(/^\d{1,20}$/.test(cleaned)) return {uid:cleaned,code:'ok'};
+    return {uid:null,code:'invalid_uid'};
   }
 
   async function loadRecent(){
@@ -560,11 +622,14 @@ function homepageHtml(siteKey, scriptNonce = "") {
     event.preventDefault();
     errorLine.textContent='';
     renderWarnings([]);
-    const uid=String(uidInput.value||'').trim();
-    if(!/^\d{1,20}$/.test(uid)){
-      errorLine.textContent='UID 格式错误';
+    sourceHint.textContent='';
+    const parsed=parseSingleUidInput(uidInput.value);
+    if(!parsed.uid){
+      errorLine.textContent=parsed.code==='multi_uid'?'仅支持单 UID，请一次只输入一个 UID':'UID 格式错误，请输入 1-20 位数字';
       return;
     }
+    const uid=parsed.uid;
+    uidInput.value=uid;
     submitBtn.disabled=true;
     try{
       setStatus('检查数据源连通性');
@@ -595,6 +660,33 @@ function homepageHtml(siteKey, scriptNonce = "") {
   document.getElementById('generate-form').addEventListener('submit',onSubmit);
   loadRecent();
   </script></body></html>`;
+}
+
+function adminHtml() {
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Remember Admin</title>
+  <style>${buildSiteThemeCss()}
+  .admin-links{list-style:none;padding:0;margin:0}
+  .admin-links li{padding:10px 0;border-bottom:1px solid var(--theme-line)}
+  .admin-links li:last-child{border-bottom:none}
+  .admin-links a{text-decoration:none;border-bottom:1px solid transparent;transition:border-color var(--theme-motion) ease,color var(--theme-motion) ease}
+  .admin-links a:hover{color:var(--theme-accent);border-bottom-color:var(--theme-accent)}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--theme-card);padding:1px 6px;border-radius:999px;border:1px solid var(--theme-line)}
+  </style></head><body>
+  <main class="site-shell">
+    <header class="hero">
+      <h1>管理页</h1>
+      <p class="lead">用于处理移除申请与页面维护。请通过 Cloudflare Access 进行受控访问。</p>
+    </header>
+    <section class="panel">
+      <h2>常用接口</h2>
+      <ul class="admin-links">
+        <li><a href="/api/admin/requests?status=pending">待处理申请</a></li>
+        <li><a href="/api/admin/requests?status=approved">已通过申请</a></li>
+        <li><a href="/api/admin/requests?status=rejected">已拒绝申请</a></li>
+      </ul>
+      <p class="hint">可用 <code>/api/admin/pages/:uid/unpublish</code> 与 <code>/api/admin/pages/:uid/regenerate</code> 维护单页状态。</p>
+    </section>
+  </main></body></html>`;
 }
 
 async function getRecent(env, limit = MAX_RECENT, options = {}) {
@@ -729,27 +821,27 @@ function proxySchemaValidator(source, payload) {
 async function handleProxy(request, env, url) {
   await enforceIpRateLimit(env, request, "proxy", 120, 30);
   const source = url.pathname.split("/").pop();
-  const uid = normalizeUid(url.searchParams.get("uid"));
+  const rawUid = url.searchParams.get("uid");
   const bvid = String(url.searchParams.get("bvid") || "").trim();
   const aid = String(url.searchParams.get("aid") || "").trim();
   if (!["allVid", "comment", "vidInfo", "danmu", "zhibodanmu"].includes(source)) throw new HttpError(400, "source 不合法");
 
   let upstream;
   if (source === "allVid") {
-    if (!uid) throw new HttpError(400, "allVid 需要 uid");
+    const uid = parseRequiredUidOrThrow(rawUid, "allVid 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn"), 1, 200, 1);
     upstream = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=50&pn=${pn}`;
   } else if (source === "comment") {
-    if (!uid) throw new HttpError(400, "comment 需要 uid");
+    const uid = parseRequiredUidOrThrow(rawUid, "comment 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
     upstream = `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&mode=0`;
   } else if (source === "danmu") {
-    if (!uid) throw new HttpError(400, "danmu 需要 uid");
+    const uid = parseRequiredUidOrThrow(rawUid, "danmu 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
     const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
     upstream = `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
   } else if (source === "zhibodanmu") {
-    if (!uid) throw new HttpError(400, "zhibodanmu 需要 uid");
+    const uid = parseRequiredUidOrThrow(rawUid, "zhibodanmu 需要 uid");
     const pn = parseBoundedInt(url.searchParams.get("pn") || url.searchParams.get("page"), 1, 1000, 1);
     const keyword = sanitizeSearchKeyword(url.searchParams.get("keyword"));
     upstream = `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${pn}&ps=100&keyword=${encodeURIComponent(keyword)}`;
@@ -781,8 +873,7 @@ async function handleProxy(request, env, url) {
 
 async function handleUploadInit(request, env) {
   const body = await request.json().catch(() => ({}));
-  const uid = normalizeUid(body.uid);
-  if (!uid) throw new HttpError(400, "uid 不合法");
+  const uid = parseSingleUidOrThrow(body.uid);
   const size = Number(body.size || 0);
   if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_SIZE) throw new HttpError(400, "上传大小不合法");
   await verifyTurnstile(request, env, body.turnstileToken);
@@ -852,8 +943,7 @@ async function handleUploadComplete(request, env) {
 
 async function handleGenerate(request, env, ctx) {
   const body = await request.json().catch(() => ({}));
-  const uid = normalizeUid(body.uid);
-  if (!uid) throw new HttpError(400, "uid 不合法");
+  const uid = parseSingleUidOrThrow(body.uid);
   await verifyTurnstile(request, env, body.turnstileToken);
   await enforceIpRateLimit(env, request, "generate", 10, 4);
 
@@ -925,8 +1015,7 @@ async function handleJob(env, jobId) {
 
 async function handleRemovalCreate(request, env) {
   const body = await request.json().catch(() => ({}));
-  const uid = normalizeUid(body.uid);
-  if (!uid) throw new HttpError(400, "uid 不合法");
+  const uid = parseSingleUidOrThrow(body.uid);
   await verifyTurnstile(request, env, body.turnstileToken);
   await enforceIpRateLimit(env, request, "removal-create", 8, 3);
   const id = randomId("rr");
@@ -1002,7 +1091,7 @@ async function cleanupRemovedUidData(env, uid) {
 async function handleAdmin(request, env, url, ctx) {
   await requireAdminAccessStrict(request, env);
   if (request.method === "GET" && url.pathname === "/admin") {
-    return htmlResponse("<h1>Admin</h1><p>可通过 /api/admin/* 使用管理接口。</p>", 200, { "cache-control": "no-store" });
+    return htmlResponse(adminHtml(), 200, { "cache-control": "no-store" });
   }
   if (request.method === "GET" && url.pathname === "/api/admin/requests") {
     const statusParam = String(url.searchParams.get("status") || "pending").trim();

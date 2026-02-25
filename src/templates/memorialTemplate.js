@@ -1,3 +1,5 @@
+import { buildSiteThemeCss } from "./siteTheme.js";
+
 function listOrEmpty(items, emptyHtml) {
   return items.length > 0 ? items.join("") : emptyHtml;
 }
@@ -15,6 +17,7 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
   const regRange = String(snapshot?.regDateEstimate?.estimatedRange || "未知");
   const generatedAt = new Date(snapshot?.createdAt || Date.now()).toLocaleString();
   const dataNotice = String(snapshot?.dataNotice || "第三方API数据可能不准确，仅供纪念参考");
+  const memorialLine = String(model?.signature || "此账号已注销。这里保留其公开留下的片段。");
 
   const uploadRows = uploads.length
     ? uploads
@@ -61,68 +64,77 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
 
   const highlightRows = listOrEmpty(
     highlights.slice(0, 10).map((item) => `<li>${esc(item)}</li>`),
-    "<li>暂无高亮摘要</li>",
+    "<li>暂无可展示片段</li>",
   );
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>UID ${esc(uid)} 纪念页</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <style>
-  body{font-family:system-ui;background:#f4f6fb;padding:20px;color:#1f2735}
-  .card{max-width:980px;margin:0 auto;background:#fff;border:1px solid #dce4f2;border-radius:12px;padding:16px}
-  .notice{padding:10px 12px;background:#fff8e8;border:1px solid #f1dc9a;border-radius:8px;color:#6b4d00;margin:12px 0}
-  section{margin-top:18px}
-  h1,h2,h3{margin:0 0 10px}
-  table{width:100%;border-collapse:collapse}
-  td,th{border-bottom:1px solid #ecf1f8;padding:8px;text-align:left}
-  ul{padding-left:18px;margin:8px 0}
-  code{background:#f5f7fb;padding:2px 4px;border-radius:4px}
-  .tags{display:flex;gap:8px;flex-wrap:wrap}
-  .tag{display:inline-block;padding:4px 8px;border-radius:999px;background:#eef3ff;border:1px solid #ccd7ff;color:#2d3f85;font-size:12px}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-  @media (max-width: 800px){.grid{grid-template-columns:1fr}}
+  <style>${buildSiteThemeCss()}
+  .memorial-metrics{list-style:none;padding:0;margin:10px 0 0}
+  .memorial-metrics li{padding:6px 0;border-bottom:1px solid var(--theme-line)}
+  .memorial-metrics li:last-child{border-bottom:none}
+  .memorial-list li{padding:6px 0;border-bottom:1px solid var(--theme-line)}
+  .memorial-list li:last-child{border-bottom:none}
+  .notice-card{border:1px solid var(--theme-line);border-radius:10px;padding:10px 12px;background:var(--theme-card)}
+  .fold{margin-top:12px}
   </style></head>
-  <body><div class="card">
-    <h1>UID ${esc(uid)} 纪念页</h1>
-    <p>页面生成时间：${esc(generatedAt)}</p>
-    <div class="notice">数据声明：${esc(dataNotice)}</div>
-
-    <section>
-      <h2>用户画像摘要</h2>
-      <p>${esc(model.summary || "模型未返回结构化摘要，已使用降级文案。")}</p>
-      <div class="tags">${tagRows}</div>
-      <h3>高亮片段</h3>
-      <ul>${highlightRows}</ul>
-    </section>
-
-    <section class="grid">
-      <div>
-        <h2>时间线摘要</h2>
-        <ul>
-          <li>注册时间估算：${esc(regRange)}</li>
-          <li>投稿总数：${Number(snapshot?.allVid?.total || 0)}</li>
-          <li>评论总数：${Number(snapshot?.comments?.total || 0)}</li>
-          <li>视频弹幕总数：${Number(snapshot?.danmu?.total || 0)}</li>
-          <li>直播弹幕总数：${Number(snapshot?.liveDanmu?.total || 0)}</li>
-        </ul>
+  <body><main class="site-shell">
+    <header class="hero">
+      <h1>UID ${esc(uid)} 纪念页</h1>
+      <p class="lead">${esc(memorialLine)}</p>
+      <div class="meta-row">
+        <span class="meta-chip">加入时间估算：${esc(regRange)}</span>
+        <span class="meta-chip">最后存档生成：${esc(generatedAt)}</span>
       </div>
-      <div>
-        <h2>上传数据</h2>
-        <table><thead><tr><th>文件名</th><th>大小</th><th>MIME</th></tr></thead><tbody>${uploadRows}</tbody></table>
+    </header>
+
+    <section class="panel">
+      <h2>留下的话</h2>
+      <p class="quote">${esc(model.summary || "这里保存的是公开可用的贡献片段。")}</p>
+      <div class="tag-list">${tagRows}</div>
+      <div class="notice-card fold muted">数据声明：${esc(dataNotice)}</div>
+    </section>
+
+    <section class="panel">
+      <h2>代表性贡献</h2>
+      <ul class="memorial-list">${videoRows}</ul>
+    </section>
+
+    <section class="panel">
+      <h2>片段记录</h2>
+      <div class="grid-two">
+        <div>
+          <h3>评论片段</h3>
+          <ul class="memorial-list">${commentRows}</ul>
+        </div>
+        <div>
+          <h3>视频弹幕片段</h3>
+          <ul class="memorial-list">${danmuRows}</ul>
+        </div>
+      </div>
+      <div class="fold">
+        <h3>直播弹幕片段</h3>
+        <ul class="memorial-list">${liveDanmuRows}</ul>
       </div>
     </section>
 
-    <section>
-      <h2>代表视频（Top 10）</h2>
-      <ul>${videoRows}</ul>
+    <section class="panel">
+      <h2>档案信息</h2>
+      <div class="grid-two">
+        <div>
+          <ul class="memorial-metrics">
+            <li>投稿总数：${Number(snapshot?.allVid?.total || 0)}</li>
+            <li>评论总数：${Number(snapshot?.comments?.total || 0)}</li>
+            <li>视频弹幕总数：${Number(snapshot?.danmu?.total || 0)}</li>
+            <li>直播弹幕总数：${Number(snapshot?.liveDanmu?.total || 0)}</li>
+          </ul>
+          <h3>高亮片段</h3>
+          <ul class="memorial-list">${highlightRows}</ul>
+        </div>
+        <div>
+          <h3>上传数据</h3>
+          <table class="table"><thead><tr><th>文件名</th><th>大小</th><th>MIME</th></tr></thead><tbody>${uploadRows}</tbody></table>
+        </div>
+      </div>
     </section>
-
-    <section class="grid">
-      <div><h2>评论片段</h2><ul>${commentRows}</ul></div>
-      <div><h2>视频弹幕片段</h2><ul>${danmuRows}</ul></div>
-    </section>
-
-    <section>
-      <h2>直播弹幕片段</h2>
-      <ul>${liveDanmuRows}</ul>
-    </section>
-  </div></body></html>`;
+  </main></body></html>`;
 }
