@@ -119,6 +119,7 @@ export class UpstreamClient {
     const maxBackoffMs = Math.max(backoffBaseMs, Number(options.maxBackoffMs ?? this.maxBackoffMs) || this.maxBackoffMs);
     const backoffJitterRatio = normalizeRatio(options.backoffJitterRatio ?? this.backoffJitterRatio, this.backoffJitterRatio);
     const schema = options.schema || null;
+    const retryOnSchemaFailure = Boolean(options.retryOnSchemaFailure);
     const retryDelay = async (attempt, retryAfterMs = null) => {
       const delayMs = Number.isFinite(retryAfterMs)
         ? Math.min(maxBackoffMs, Math.max(0, Number(retryAfterMs)))
@@ -169,6 +170,13 @@ export class UpstreamClient {
               continue;
             }
             throw new UpstreamTimeoutError("上游请求超时", { timeoutMs, url: parsed.toString() });
+          }
+          if (err instanceof UpstreamSchemaError) {
+            if (attempt < maxRetries && retryOnSchemaFailure) {
+              await retryDelay(attempt);
+              continue;
+            }
+            throw err;
           }
           if (err instanceof UpstreamError) {
             if (attempt < maxRetries && isRetryableUpstreamError(err)) {

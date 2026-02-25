@@ -9,6 +9,47 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function toNonNegativeIntOrNull(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.trunc(n);
+}
+
+function pickArchivePayload(payload) {
+  if (!isRecord(payload)) return null;
+  if (Array.isArray(payload.videos)) return payload;
+  if (isRecord(payload.data) && Array.isArray(payload.data.videos)) return payload.data;
+  return null;
+}
+
+function isArchivePayload(payload) {
+  const archive = pickArchivePayload(payload);
+  if (!archive) return false;
+  const total = toNonNegativeIntOrNull(archive.total);
+  return total !== null;
+}
+
+const AICU_LIST_KEY_BY_SOURCE = {
+  comment: "replies",
+  danmu: "videodmlist",
+  zhibodanmu: "list",
+};
+
+function isAicuPayload(source, payload) {
+  if (!isRecord(payload) || Number(payload.code) !== 0) return false;
+  const data = payload.data;
+  if (!isRecord(data)) return false;
+  const cursor = data.cursor;
+  if (!isRecord(cursor) || typeof cursor.is_end !== "boolean") return false;
+  if (toNonNegativeIntOrNull(cursor.all_count) === null) return false;
+  const listKey = AICU_LIST_KEY_BY_SOURCE[source];
+  return Array.isArray(data[listKey]);
+}
+
 const ARCHIVE_RETRY_OPTIONS = {
   retries: 4,
   timeoutMs: 10000,
@@ -44,12 +85,15 @@ export async function fetchAllVideosByUid(client, uid, options = {}) {
     const url = `https://uapis.cn/api/v1/social/bilibili/archives?mid=${encodeURIComponent(uid)}&ps=${pageSize}&pn=${page}`;
     const { data } = await client.requestJson(url, {
       ...ARCHIVE_RETRY_OPTIONS,
-      schema: (payload) => payload && typeof payload === "object",
+      schema: isArchivePayload,
+      retryOnSchemaFailure: true,
     });
 
-    const currentVideos = toSafeArray(data.videos ?? data?.data?.videos);
-    const currentTotal = Number(data.total ?? data?.data?.total ?? 0);
-    if (Number.isFinite(currentTotal) && currentTotal >= 0) total = currentTotal;
+    const archive = pickArchivePayload(data);
+    if (!archive) throw new UpstreamError("archive payload invalid");
+    const currentVideos = toSafeArray(archive.videos);
+    const currentTotal = toNonNegativeIntOrNull(archive.total);
+    if (currentTotal !== null) total = currentTotal;
 
     if (currentVideos.length === 0) break;
     videos.push(...currentVideos);
@@ -75,19 +119,31 @@ async function fetchAicuByPage(client, source, uid, page, keyword = "") {
   if (source === "comment") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getreply?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&mode=0`,
-      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
+      {
+        ...AICU_RETRY_OPTIONS,
+        schema: (payload) => isAicuPayload("comment", payload),
+        retryOnSchemaFailure: true,
+      },
     );
   }
   if (source === "danmu") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getvideodm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`,
-      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
+      {
+        ...AICU_RETRY_OPTIONS,
+        schema: (payload) => isAicuPayload("danmu", payload),
+        retryOnSchemaFailure: true,
+      },
     );
   }
   if (source === "zhibodanmu") {
     return client.requestJson(
       `https://api.aicu.cc/api/v3/search/getlivedm?uid=${encodeURIComponent(uid)}&pn=${page}&ps=100&keyword=${encodeURIComponent(keyword)}`,
-      { ...AICU_RETRY_OPTIONS, schema: (payload) => payload && typeof payload === "object" },
+      {
+        ...AICU_RETRY_OPTIONS,
+        schema: (payload) => isAicuPayload("zhibodanmu", payload),
+        retryOnSchemaFailure: true,
+      },
     );
   }
   throw new UpstreamError("未知的 AICU 数据源", { source });
@@ -101,9 +157,10 @@ function extractAicuPage(source, data) {
 }
 
 function extractAicuCursor(data) {
+  const allCount = toNonNegativeIntOrNull(data?.data?.cursor?.all_count);
   return {
     isEnd: Boolean(data?.data?.cursor?.is_end),
-    allCount: Number(data?.data?.cursor?.all_count ?? 0),
+    allCount: allCount ?? 0,
   };
 }
 
@@ -219,7 +276,8 @@ export async function fetchTopVideoInfosByPlayCount(client, videos, options = {}
     const query = bvid ? `bvid=${encodeURIComponent(bvid)}` : `aid=${encodeURIComponent(aid)}`;
     const { data } = await client.requestJson(`https://uapis.cn/api/v1/social/bilibili/view?${query}`, {
       ...VIDEO_VIEW_RETRY_OPTIONS,
-      schema: (payload) => payload && typeof payload === "object",
+      schema: (payload) => isRecord(payload) && Boolean(payload?.aid || payload?.bvid || payload?.data?.aid || payload?.data?.bvid),
+      retryOnSchemaFailure: true,
     });
     return {
       bvid: bvid || String(data?.bvid || ""),

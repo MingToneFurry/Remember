@@ -14,6 +14,7 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
   const model = snapshot?.modelOutput || {};
   const profileTags = Array.isArray(model.profileTags) ? model.profileTags : [];
   const highlights = Array.isArray(model.highlights) ? model.highlights : [];
+  const sourceWarnings = Array.isArray(snapshot?.sourceWarnings) ? snapshot.sourceWarnings.filter(Boolean) : [];
   const regRange = String(snapshot?.regDateEstimate?.estimatedRange || "未知");
   const generatedAt = new Date(snapshot?.createdAt || Date.now()).toLocaleString();
   const dataNotice = String(snapshot?.dataNotice || "第三方API数据可能不准确，仅供纪念参考");
@@ -66,6 +67,10 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
     highlights.slice(0, 10).map((item) => `<li>${esc(item)}</li>`),
     "<li>暂无可展示片段</li>",
   );
+  const warningRows = listOrEmpty(
+    sourceWarnings.slice(0, 6).map((item) => `<li>${esc(item)}</li>`),
+    "<li>暂无采集告警</li>",
+  );
 
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><title>UID ${esc(uid)} 纪念页</title><meta name="viewport" content="width=device-width,initial-scale=1"/>
   <style>${buildSiteThemeCss()}
@@ -92,6 +97,10 @@ export function buildMemorialPage(uid, snapshot = {}, escapeHtml) {
       <p class="quote">${esc(model.summary || "这里保存的是公开可用的贡献片段。")}</p>
       <div class="tag-list">${tagRows}</div>
       <div class="notice-card fold muted">数据声明：${esc(dataNotice)}</div>
+      <div class="fold">
+        <h3>采集状态</h3>
+        <ul class="memorial-list">${warningRows}</ul>
+      </div>
     </section>
 
     <section class="panel">

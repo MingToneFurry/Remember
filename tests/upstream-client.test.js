@@ -69,3 +69,25 @@ test("should not retry non-retryable upstream status", async () => {
   await assert.rejects(() => client.requestJson("https://uapis.cn/api/test"), UpstreamError);
   assert.equal(attempts, 1);
 });
+
+test("should retry schema failures when retryOnSchemaFailure is enabled", async () => {
+  let attempts = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["uapis.cn"],
+    retries: 3,
+    timeoutMs: 100,
+    backoffBaseMs: 1,
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts < 3) return jsonResponse(200, { code: -666, message: "busy" });
+      return jsonResponse(200, { code: 0, data: { ok: true } });
+    },
+  });
+
+  const { data } = await client.requestJson("https://uapis.cn/api/test", {
+    schema: (payload) => Number(payload?.code) === 0,
+    retryOnSchemaFailure: true,
+  });
+  assert.equal(data.code, 0);
+  assert.equal(attempts, 3);
+});

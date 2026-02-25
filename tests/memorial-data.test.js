@@ -45,6 +45,25 @@ test("fetchAllVideosByUid should return empty list for zero total", async () => 
   assert.deepEqual(result.videos, []);
 });
 
+test("fetchAllVideosByUid should retry transient invalid payloads", async () => {
+  let attempts = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["uapis.cn"],
+    retries: 0,
+    timeoutMs: 200,
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts === 1) return jsonResponse(200, { code: -666, message: "busy" });
+      return jsonResponse(200, { total: 1, videos: [{ bvid: "BV1111111111" }] });
+    },
+  });
+
+  const result = await fetchAllVideosByUid(client, "777", { pageSize: 1, maxPages: 1 });
+  assert.equal(result.total, 1);
+  assert.equal(result.videos.length, 1);
+  assert.equal(attempts, 2);
+});
+
 test("fetchPagedAicuData should stop by is_end and keep all_count", async () => {
   const pages = [
     {
@@ -102,6 +121,28 @@ test("fetchPagedAicuData should support empty zhibodanmu list", async () => {
   const result = await fetchPagedAicuData(client, "zhibodanmu", "900", { maxPages: 10, maxItems: 100 });
   assert.equal(result.items.length, 0);
   assert.equal(result.total, 0);
+});
+
+test("fetchPagedAicuData should retry transient business error payloads", async () => {
+  let attempts = 0;
+  const client = new UpstreamClient({
+    allowedHosts: ["api.aicu.cc"],
+    retries: 0,
+    timeoutMs: 200,
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts === 1) return jsonResponse(200, { code: -666, message: "busy" });
+      return jsonResponse(200, {
+        code: 0,
+        data: { cursor: { is_end: true, all_count: 0 }, videodmlist: [] },
+      });
+    },
+  });
+
+  const result = await fetchPagedAicuData(client, "danmu", "10086", { maxPages: 3, maxItems: 10 });
+  assert.equal(result.total, 0);
+  assert.equal(result.items.length, 0);
+  assert.equal(attempts, 2);
 });
 
 test("estimateRegDateByUid should map uid to expected range", () => {
