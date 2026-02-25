@@ -99,6 +99,11 @@ function createAsyncCtx() {
   };
 }
 
+function buildMinuteRateLimitKey(scope, ip, date = new Date()) {
+  const minute = `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, "0")}${String(date.getUTCDate()).padStart(2, "0")}${String(date.getUTCHours()).padStart(2, "0")}${String(date.getUTCMinutes()).padStart(2, "0")}`;
+  return `rl:ipm:${scope}:${ip}:${minute}`;
+}
+
 test("GET / should render nonce-based CSP and script nonce", async () => {
   const env = createEnv();
   const request = new Request("https://rem.furry.ist/", { method: "GET" });
@@ -336,4 +341,78 @@ test("queue should retry when attempts are below max", async () => {
 
   assert.equal(ackCount, 0);
   assert.equal(retryCount, 1);
+});
+
+test("queue should ack running jobs without reprocessing", async () => {
+  const env = createEnv();
+  const jobId = "job_1234567890abcdef1234567890abcdef";
+  await env.REMEMBER_KV.put(
+    `job:${jobId}`,
+    JSON.stringify({
+      jobId,
+      uid: "123456",
+      status: "running",
+      stage: "fetching",
+      warnings: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    }),
+  );
+
+  let ackCount = 0;
+  let retryCount = 0;
+  const message = {
+    body: JSON.stringify({ jobId, uid: "123456" }),
+    ack() {
+      ackCount += 1;
+    },
+    retry() {
+      retryCount += 1;
+    },
+  };
+
+  const ctx = createAsyncCtx();
+  runtime.queue({ messages: [message] }, env, ctx);
+  await ctx.flush();
+
+  const stored = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+  assert.equal(stored.status, "running");
+  assert.equal(ackCount, 1);
+  assert.equal(retryCount, 0);
+});
+
+test("PUT /api/upload/part should be rate-limited", async () => {
+  const env = createEnv();
+  const ip = "1.2.3.4";
+  await env.REMEMBER_KV.put(buildMinuteRateLimitKey("upload-part", ip), "120");
+
+  const response = await runtime.fetch(
+    new Request("https://rem.furry.ist/api/upload/part?uploadId=upload-x&partNumber=1", {
+      method: "PUT",
+      headers: { "cf-connecting-ip": ip },
+      body: "part-body",
+    }),
+    env,
+    createCtx(),
+  );
+
+  assert.equal(response.status, 429);
+});
+
+test("POST /api/upload/complete should be rate-limited", async () => {
+  const env = createEnv();
+  const ip = "5.6.7.8";
+  await env.REMEMBER_KV.put(buildMinuteRateLimitKey("upload-complete", ip), "20");
+
+  const response = await runtime.fetch(
+    new Request("https://rem.furry.ist/api/upload/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json", "cf-connecting-ip": ip },
+      body: JSON.stringify({ uploadId: "upload-y", parts: [{ partNumber: 1, etag: "etag-1" }] }),
+    }),
+    env,
+    createCtx(),
+  );
+
+  assert.equal(response.status, 429);
 });

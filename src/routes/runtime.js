@@ -18,6 +18,10 @@ const PUBLIC_ERROR_DETAIL_LIMIT = 5;
 const PUBLIC_ERROR_TEXT_LIMIT = 160;
 const HOT_CACHE_TTL_MS = 15 * 1000;
 const SITEMAP_CACHE_KEY = "cache:sitemap:xml";
+const UPLOAD_PART_LIMIT_PER_DAY = 2000;
+const UPLOAD_PART_LIMIT_PER_MINUTE = 120;
+const UPLOAD_COMPLETE_LIMIT_PER_DAY = 200;
+const UPLOAD_COMPLETE_LIMIT_PER_MINUTE = 20;
 const upstreamClient = createDefaultUpstreamClient(fetch);
 const hotCache = {
   recent: { expiresAt: 0, items: [] },
@@ -620,7 +624,7 @@ async function processGenerateJob(env, jobId) {
   const jobKey = `job:${jobId}`;
   const current = await env.REMEMBER_KV.get(jobKey, "json");
   if (!current) return;
-  if (!["queued", "pending", "running"].includes(String(current.status || ""))) return;
+  if (!["queued", "pending"].includes(String(current.status || ""))) return;
   const uid = normalizeUid(current.uid);
   if (!uid) {
     await env.REMEMBER_KV.put(jobKey, JSON.stringify({ ...current, status: "failed", stage: "failed", error: "uid 不合法", updatedAt: Date.now() }), {
@@ -797,6 +801,7 @@ async function handleUploadPart(request, env, url) {
   const uploadId = String(url.searchParams.get("uploadId") || "");
   const partNumber = Number(url.searchParams.get("partNumber") || "0");
   if (!uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PARTS) throw new HttpError(400, "参数不合法");
+  await enforceIpRateLimit(env, request, "upload-part", UPLOAD_PART_LIMIT_PER_DAY, UPLOAD_PART_LIMIT_PER_MINUTE);
   const token = request.headers.get("x-upload-token") || request.headers.get("x-upload-session-token") || "";
   const payload = await verifySignedToken(env, token);
   if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
@@ -812,6 +817,7 @@ async function handleUploadComplete(request, env) {
   const uploadId = String(body.uploadId || "");
   const parts = Array.isArray(body.parts) ? body.parts : [];
   if (!uploadId || parts.length === 0) throw new HttpError(400, "参数不完整");
+  await enforceIpRateLimit(env, request, "upload-complete", UPLOAD_COMPLETE_LIMIT_PER_DAY, UPLOAD_COMPLETE_LIMIT_PER_MINUTE);
   await verifyTurnstile(request, env, body.turnstileToken);
   const payload = await verifySignedToken(env, body.uploadToken || body.sessionToken || "");
   if (!payload || payload.uploadId !== uploadId) throw new HttpError(403, "上传令牌无效");
@@ -1247,6 +1253,12 @@ async function handleQueue(batch, env) {
     }
 
     try {
+      const current = await env.REMEMBER_KV.get(`job:${jobId}`, "json");
+      const status = String(current?.status || "");
+      if (!["queued", "pending"].includes(status)) {
+        if (typeof message.ack === "function") message.ack();
+        continue;
+      }
       await processGenerateJob(env, jobId);
       if (typeof message.ack === "function") message.ack();
     } catch (err) {
